@@ -1,7 +1,9 @@
+import os
 import flet as ft
 import traceback
 import asyncio
 import subprocess
+
 
 class TelegramPlayerUI:
     def __init__(self, page: ft.Page, backend):
@@ -113,10 +115,19 @@ class TelegramPlayerUI:
         )
 
         reaction_controls = []
-        for emoji_text, icon_data in self.EMOJI_ICONS.items():
+        for emoji_text in self.EMOJI_COLORS.keys(): # Итерируемся по ключам-эмодзи
             cb = ft.Checkbox(value=False, data=emoji_text)
-            icon_item = ft.Icon(icon=icon_data, color=self.EMOJI_COLORS[emoji_text], size=22)
-            emoji_block = ft.Row(controls=[cb, icon_item], spacing=2, alignment=ft.MainAxisAlignment.START, vertical_alignment=ft.CrossAxisAlignment.CENTER)
+            
+            # Заменяем старый ft.Icon на фирменный ft.Image
+            url = self.get_telegram_emoji_url(emoji_text)
+            icon_item = ft.Image(src=url, width=22, height=22, error_content=ft.Text(emoji_text))
+            
+            emoji_block = ft.Row(
+                controls=[cb, icon_item], 
+                spacing=2, 
+                alignment=ft.MainAxisAlignment.START, 
+                vertical_alignment=ft.CrossAxisAlignment.CENTER
+            )
             reaction_controls.append(emoji_block)
 
         # Инициализируем чекбокс audio с отступом слева для визуального разделения
@@ -181,6 +192,21 @@ class TelegramPlayerUI:
         
         # Запускаем фоновый Event
         asyncio.run_coroutine_threadsafe(self.wait_for_telegram_and_refresh(), self.main_loop)
+
+    # Словарь с точными 3D-эмодзи Telegram
+    # В файле ui.py
+    TELEGRAM_3D_EMOJI = {
+        '❤️': 'assets/heart.webp',
+        '👍': 'assets/thumbs_up.webp',
+        '🔥': 'assets/fire.webp',
+        # ... добавьте остальные
+    }
+    
+    def get_telegram_emoji_url(self, emoji: str) -> str:
+        """Возвращает прямую ссылку на 3D-эмодзи Telegram"""
+        cleaned = emoji.strip()
+        # Ищем точное совпадение или фолбэк на ❤️
+        return self.TELEGRAM_3D_EMOJI.get(cleaned, self.TELEGRAM_3D_EMOJI['❤️'])
 
     # =========================================================================
     # ЧИСТЫЕ МЕТОДЫ БЕЗ СИСТЕМНЫХ АРГУМЕНТОВ ДЛЯ НАДЕЖНОСТИ
@@ -275,7 +301,51 @@ class TelegramPlayerUI:
             # 2. Собираем текстовые данные из элементов ListTile
             forum_id = self.forum_dropdown.value
             forum_name = self.get_forum_username(forum_id)
+
             lines = []
+
+            # форум
+            forum_text = next(
+                (opt.text for opt in self.forum_dropdown.options if opt.key == self.forum_dropdown.value), 
+                "Ничего не выбрано"
+            )
+            line = f"{forum_text}"
+            lines.append(line)
+
+            # топик
+            topic_text = next(
+                (opt.text for opt in self.topic_dropdown.options if opt.key == self.topic_dropdown.value), 
+                ""
+            )
+            line = f"{topic_text}"
+            lines.append(line)
+
+            # раздел
+            subject_text = next(
+                (opt.text for opt in self.subject_dropdown.options if opt.key == self.subject_dropdown.value), 
+                ""
+            )
+            line = f"{subject_text}"
+            lines.append(line)
+
+            # фильтры период и реакции
+            # Находим выбранную радиокнопку по совпадению value
+            active_radio = next(
+                (control for control in self.filter_radio_group.content.controls 
+                 if isinstance(control, ft.Radio) and control.value == self.filter_radio_group.value),
+                None
+            )
+
+            # Получаем период
+            active_filter_text = active_radio.label if active_radio else ""
+            line = f"{active_filter_text}"
+            lines.append(line)
+
+            # реакции
+            marked_emojis = list(self.selected_reactions) # Выведет, например: ['🔥', '👍']
+            line = f"{marked_emojis}"
+            lines.append(line)
+
             for control in self.posts_list.controls:
                 if isinstance(control, ft.ListTile):
                     msg_data = control.data
@@ -291,7 +361,7 @@ class TelegramPlayerUI:
                         lines.append(line)
             
             # 3. Записываем строки в файл с кодировкой UTF-8
-            file_path = "./messages.txt"
+            file_path = "messages.txt"
             with open(file_path, "w", encoding="utf-8") as f:
                 f.write("\n".join(lines))
             
@@ -301,7 +371,10 @@ class TelegramPlayerUI:
             
             # 4. Открываем файл в системном текстовом редакторе (Linux / xdg-open)
             try:
-                subprocess.Popen(["xdg-open", file_path])
+                if os.name == 'nt':
+                    os.startfile(file_path)
+                else:
+                    subprocess.Popen(["xdg-open", file_path])
                 print(f"[UI System Call] Выполнение команды: xdg-open {file_path}")
             except Exception as system_ex:
                 print(f"[UI System Error] Не удалось открыть файл через xdg-open: {system_ex}")
@@ -498,42 +571,39 @@ class TelegramPlayerUI:
                 # --- ИЗМЕНЕНИЕ: Формируем цепочку гарантированно ЦВЕТНЫХ элементов ---
                 # --- СТАБИЛЬНЫЙ ВАРИАНТ ДЛЯ FLET 1.0.5+ (ПОЗИЦИОННЫЙ АРГУМЕНТ) ---
                 # --- ИСПРАВЛЕНО ДЛЯ FLET 1.0.5+: Использование классов Padding и Alignment ---
+                # --- ОБНОВЛЕННЫЙ ЦИКЛ: РЕНДЕР ОФИЦИАЛЬНЫХ ТЕЛЕГРАМ-ЭМОДЗИ ---
                 reaction_controls = []
                 for emoji in msg.get('reactions', []):
                     clean_emoji = emoji.strip()
                     if not clean_emoji:
                         continue
-                        
-                    if clean_emoji in self.EMOJI_ICONS:
+                    
+                    #emoji_url = self.get_telegram_emoji_url(clean_emoji)
+                    # Пример для огня
+                    emoji_url = "assets/emoji/1f525.webp" 
+                    
+                    if emoji_url:
                         reaction_controls.append(
-                            ft.Icon(
-                                self.EMOJI_ICONS[clean_emoji],
-                                color=self.EMOJI_COLORS[clean_emoji],
-
-
-                                size=22
+                            ft.Image(
+                                src=emoji_url,
+                                width=24,
+                                height=24,
+                                fit="contain",  # Рекомендуемый вариант для 1.0.5
+                                cache_width=48,   # Декодируем с запасом для четкости (Retina)
+                                cache_height=48,
+                                error_content=ft.Text(clean_emoji, size=16, color=ft.Colors.ORANGE_200),
                             )
                         )
                     else:
-                        # Заменили ft.padding.all -> ft.Padding(4)
-                        # Заменили ft.alignment.center -> ft.Alignment(0, 0)
-                        reaction_controls.append(
-                            ft.Container(
-                                content=ft.Text(clean_emoji, size=14, weight=ft.FontWeight.BOLD),
-                                bgcolor=ft.Colors.SURFACE_CONTAINER_HIGH,
-                                padding=ft.Padding(4, 4, 4, 4), # Либо просто ft.Padding(4,4,4,4) для всех сторон
-                                border_radius=4,
-                                alignment=ft.Alignment(0, 0) 
-                            )
-                        )
-                
-                # Помещаем цветные элементы в горизонтальный ряд с ограничением по ширине (tight=True)
+                        reaction_controls.append(ft.Text(clean_emoji, size=16))
+
+                # Помещаем картинки-эмодзи в горизонтальный ряд
                 trailing_row = ft.Row(
                     controls=reaction_controls,
                     tight=True,
                     alignment=ft.MainAxisAlignment.END,
                     vertical_alignment=ft.CrossAxisAlignment.CENTER,
-                    spacing=6
+                    spacing=4
                 )
                 
                 self.posts_list.controls.append(
@@ -585,7 +655,10 @@ class TelegramPlayerUI:
             
             try:
                 # Безопасный запуск xdg-open без shell=True
-                subprocess.Popen(["xdg-open", tg_url])
+                if os.name == 'nt':
+                    os.startfile(tg_url)
+                else:
+                    subprocess.Popen(["xdg-open", tg_url])
             except Exception as ex:
                 print(f"[UI System Error] Не удалось открыть ссылку через xdg-open: {ex}")
 

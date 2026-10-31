@@ -55,4 +55,4 @@ def main(page: ft.Page):
     page.run_task(start_telegram)
 
 if __name__ == "__main__":
-    ft.run(main)
+    ft.run(main, assets_dir="assets")
