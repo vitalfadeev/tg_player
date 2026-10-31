@@ -9,19 +9,28 @@ from telethon.tl.functions.messages import GetForumTopicsRequest
 # Импортируем настройки из созданного файла config.py
 import config
 
-def login(session_name='session_faketls'):
+def login(session_name='session_faketls',proxy_mode='mtproto'):
     """
     Инициализирует и возвращает настроенный клиент TelegramClient.
     Для отправки запросов клиент необходимо активировать через 'async with client'.
     """
-    print("Подключение через FakeTLS MTProxy...")
-    client = TelegramClient(
-        session_name, 
-        config.API_ID, 
-        config.API_HASH,
-        connection=connection.ConnectionTcpMTProxyRandomizedIntermediate,
-        proxy=(config.PROXY_IP, config.PROXY_PORT, config.PROXY_SECRET)
-    )
+    client = None
+    if proxy_mode == 'mtproto':
+        print("Подключение через FakeTLS MTProxy...")
+        client = TelegramClient(
+            session_name, 
+            config.API_ID, 
+            config.API_HASH,
+            connection=connection.ConnectionTcpMTProxyRandomizedIntermediate,
+            proxy=(config.PROXY_IP, config.PROXY_PORT, config.PROXY_SECRET)
+        )
+    else:
+        print("Подключение напрямую...")
+        client = TelegramClient(
+            session_name, 
+            config.API_ID, 
+            config.API_HASH
+        )
     return client
 
 async def get_forums(client, base_data_dir="data"):

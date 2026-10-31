@@ -56,7 +56,7 @@ class TelegramPlayerUI:
         self.connection_loader = ft.Row(
             controls=[
                 ft.ProgressRing(width=16, height=16, stroke_width=2),
-                ft.Text("Подключение к Telegram через прокси...", size=12, color=ft.Colors.ORANGE_700)
+                ft.Text("Подключение к Telegram...", size=12, color=ft.Colors.ORANGE_700)
             ],
             alignment=ft.MainAxisAlignment.CENTER,
             visible=False 

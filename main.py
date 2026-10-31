@@ -1,4 +1,5 @@
 # main.py
+import argparse
 import flet as ft
 import asyncio
 import tg_backend
@@ -6,8 +7,23 @@ from backend import TelegramBackend
 from ui import TelegramPlayerUI
 
 def main(page: ft.Page):
-    # 1. Инициализируем клиент Telethon из tg_backend
-    client = tg_backend.login()
+    # Настраиваем парсер аргументов командной строки
+    parser = argparse.ArgumentParser(description="Telegram Player Application")
+    parser.add_argument(
+        "--proxy",
+        choices=["none", "mtproto"],
+        default="mtproto",
+        help="Режим соединения: none (без прокси) или mtproto (через MTProto прокси, по умолчанию)"
+    )
+    
+    # Flet передает свои аргументы в функцию main, поэтому парсим только известные нам
+    args, _ = parser.parse_known_args()
+    
+    print(f"[Main] Выбран режим соединения (proxy): {args.proxy}")
+
+    # 1. Инициализируем клиент Telethon, передавая выбранный режим прокси
+    # (Убедитесь, что функция tg_backend.login принимает этот параметр)
+    client = tg_backend.login(proxy_mode=args.proxy)
     
     # 2. Инициализируем бизнес-логику (Бэкэнд) и передаем туда клиент
     backend = TelegramBackend(client=client)
