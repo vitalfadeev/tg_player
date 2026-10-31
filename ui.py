@@ -241,10 +241,6 @@ class TelegramPlayerUI:
     # АСИНХРОННАЯ БИЗНЕС-ЛОГИКА
     # =========================================================================
 
-    # =========================================================================
-    # АСИНХРОННАЯ БИЗНЕС-ЛОГИКА
-    # =========================================================================
-
     async def to_text(self):
         """
         Сохраняет текущий список сообщений в файл ./messages.txt 
@@ -282,15 +278,7 @@ class TelegramPlayerUI:
             line = f"{topic_text}"
             lines.append(line)
 
-            # раздел
-            subject_text = next(
-                (opt.text for opt in self.subject_dropdown.options if opt.key == self.subject_dropdown.value), 
-                ""
-            )
-            line = f"{subject_text}"
-            lines.append(line)
-
-            # фильтры период и реакции
+            # Получаем период
             # Находим выбранную радиокнопку по совпадению value
             active_radio = next(
                 (control for control in self.filter_radio_group.content.controls 
@@ -298,9 +286,16 @@ class TelegramPlayerUI:
                 None
             )
 
-            # Получаем период
             active_filter_text = active_radio.label if active_radio else ""
             line = f"{active_filter_text}"
+            lines.append(line)
+
+            # раздел
+            subject_text = next(
+                (opt.text for opt in self.subject_dropdown.options if opt.key == self.subject_dropdown.value), 
+                ""
+            )
+            line = f"{subject_text}"
             lines.append(line)
 
             # реакции
