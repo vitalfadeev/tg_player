@@ -23,24 +23,7 @@ class TelegramPlayerUI:
             
         print(f"[Python 3.13 Core] UI loop initialized: {self.main_loop}")
         
-        self.EMOJI_ICONS = {
-            '🏆': ft.Icons.EMOJI_EVENTS_ROUNDED,
-            '❤': ft.Icons.FAVORITE_ROUNDED,
-            '❤️': ft.Icons.FAVORITE_ROUNDED,
-            '🔥': ft.Icons.LOCAL_FIRE_DEPARTMENT_ROUNDED,
-            '⚡': ft.Icons.FLASH_ON_ROUNDED,
-            '👍': ft.Icons.THUMB_UP_ROUNDED,
-            '❤️‍🔥': ft.Icons.WHATSHOT_ROUNDED
-        }
-        self.EMOJI_COLORS = {
-            '🏆': ft.Colors.AMBER_500,
-            '❤': ft.Colors.RED_600,
-            '❤️': ft.Colors.RED_600,
-            '🔥': ft.Colors.ORANGE_600,
-            '⚡': ft.Colors.YELLOW_500,
-            '👍': ft.Colors.BLUE_500,
-            '❤️‍🔥': ft.Colors.DEEP_ORANGE_ACCENT
-        }
+        self.EMOJI_ICONS = ['🏆','❤','❤️','🔥','⚡','👍','❤️‍🔥',]
 
     def build(self):
         self.page.title = "TG Player"
@@ -115,20 +98,15 @@ class TelegramPlayerUI:
         )
 
         reaction_controls = []
-        for emoji_text in self.EMOJI_COLORS.keys(): # Итерируемся по ключам-эмодзи
-            cb = ft.Checkbox(value=False, data=emoji_text)
-            
-            # Заменяем старый ft.Icon на фирменный ft.Image
-            url = self.get_telegram_emoji_url(emoji_text)
-            icon_item = ft.Image(src=url, width=22, height=22, error_content=ft.Text(emoji_text))
-            
-            emoji_block = ft.Row(
-                controls=[cb, icon_item], 
-                spacing=2, 
-                alignment=ft.MainAxisAlignment.START, 
-                vertical_alignment=ft.CrossAxisAlignment.CENTER
+        for emoji_text in self.EMOJI_ICONS:  # Итерируемся по ключам-эмодзи
+            # Текстовая подпись с эмодзи прямо в чекбоксе
+            cb = ft.Checkbox(
+                label=emoji_text,
+                value=False,
+                data=emoji_text,
+                label_style=ft.TextStyle(size=18),  # крупнее, чтобы эмодзи читалось
             )
-            reaction_controls.append(emoji_block)
+            reaction_controls.append(cb)
 
         # Инициализируем чекбокс audio с отступом слева для визуального разделения
         self.audio_checkbox = ft.Checkbox(
@@ -183,8 +161,7 @@ class TelegramPlayerUI:
         self.subject_dropdown.on_select = lambda e: self.on_subject_selected_bridge()
         self.filter_radio_group.on_change = lambda e: self.on_filter_changed_bridge()
 
-        for row in reaction_controls:
-            checkbox = row.controls[0]
+        for checkbox in reaction_controls:
             checkbox.on_change = lambda e: self.on_reaction_changed_bridge(e)
 
         # Фиксируем состояние на клиенте
@@ -192,22 +169,7 @@ class TelegramPlayerUI:
         
         # Запускаем фоновый Event
         asyncio.run_coroutine_threadsafe(self.wait_for_telegram_and_refresh(), self.main_loop)
-
-    # Словарь с точными 3D-эмодзи Telegram
-    # В файле ui.py
-    TELEGRAM_3D_EMOJI = {
-        '❤️': 'assets/heart.webp',
-        '👍': 'assets/thumbs_up.webp',
-        '🔥': 'assets/fire.webp',
-        # ... добавьте остальные
-    }
     
-    def get_telegram_emoji_url(self, emoji: str) -> str:
-        """Возвращает прямую ссылку на 3D-эмодзи Telegram"""
-        cleaned = emoji.strip()
-        # Ищем точное совпадение или фолбэк на ❤️
-        return self.TELEGRAM_3D_EMOJI.get(cleaned, self.TELEGRAM_3D_EMOJI['❤️'])
-
     # =========================================================================
     # ЧИСТЫЕ МЕТОДЫ БЕЗ СИСТЕМНЫХ АРГУМЕНТОВ ДЛЯ НАДЕЖНОСТИ
     # =========================================================================
@@ -577,25 +539,7 @@ class TelegramPlayerUI:
                     clean_emoji = emoji.strip()
                     if not clean_emoji:
                         continue
-                    
-                    #emoji_url = self.get_telegram_emoji_url(clean_emoji)
-                    # Пример для огня
-                    emoji_url = "assets/emoji/1f525.webp" 
-                    
-                    if emoji_url:
-                        reaction_controls.append(
-                            ft.Image(
-                                src=emoji_url,
-                                width=24,
-                                height=24,
-                                fit="contain",  # Рекомендуемый вариант для 1.0.5
-                                cache_width=48,   # Декодируем с запасом для четкости (Retina)
-                                cache_height=48,
-                                error_content=ft.Text(clean_emoji, size=16, color=ft.Colors.ORANGE_200),
-                            )
-                        )
-                    else:
-                        reaction_controls.append(ft.Text(clean_emoji, size=16))
+                    reaction_controls.append(ft.Text(clean_emoji, size=18))
 
                 # Помещаем картинки-эмодзи в горизонтальный ряд
                 trailing_row = ft.Row(

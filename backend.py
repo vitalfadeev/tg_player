@@ -86,7 +86,7 @@ class TelegramBackend:
             client=self.client,
             forum_id=forum_id,
             topic_id=topic_id,
-            limit=500
+            limit=1000
         )
 
         # 2. Если вернулась асинхронная задача Task (из-за работы внутри Flet/FastAPI), дожидаемся её
