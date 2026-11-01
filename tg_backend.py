@@ -2,9 +2,14 @@ import os
 import json
 import asyncio
 import datetime
+from datetime import time
+from zoneinfo import ZoneInfo
 from telethon import TelegramClient, connection
 from telethon.tl.types import Channel, PeerUser, PeerChannel, PeerChat
 from telethon.tl.functions.messages import GetForumTopicsRequest
+from telethon.tl.types import InputMessagesFilterMusic
+from telethon.tl.types import InputMessagesFilterPinned
+MSK = ZoneInfo("Europe/Moscow")
 
 # Импортируем настройки из созданного файла config.py
 import config
@@ -52,7 +57,8 @@ async def get_forums(client, base_data_dir="data"):
                 forum_data = {
                     "id": forum_id,
                     "title": dialog.name,
-                    "username": dialog.entity.username if dialog.entity.username else None
+                    "username": dialog.entity.username if dialog.entity.username else None,
+                    # pinned_msg_id
                 }
                 forums_list.append(forum_data)
                 
@@ -131,73 +137,167 @@ def get_topics_for_forum(forum_id, base_data_dir="data"):
         print(f"[Ошибка] Не удалось прочитать локальный файл {file_path}: {e}")
         return []
 
-def fetch_pinned_messages(client, forum_id: str, topic_id: str, limit=50, base_data_dir="data") -> list:
+def msg_from_tgmssage(message,reactions):
+    msg_reactions = []
+    total_filtered_reactions = 0
+    if message.reactions and message.reactions.results:
+        for r in message.reactions.results:
+            # Проверяем наличие атрибута emoticon (он есть только у ReactionEmoji)
+            if hasattr(r.reaction, 'emoticon'):
+                msg_reactions.append(r.reaction.emoticon)
+            elif hasattr(r.reaction, 'document_id'):
+                # Для кастомных премиум-эмодзи подставляем заглушку-звездочку
+                msg_reactions.append("⭐")
+
+            if reactions:
+                if hasattr(r.reaction, 'emoticon'):
+                    if r.reaction.emoticon in reactions:
+                        total_filtered_reactions += r.count
+            else:
+                total_filtered_reactions += r.count
+
+    # file name
+    has_file = False
+    file_name = None
+    if message.media and not message.photo:
+        has_file = True
+        file_name = getattr(message.file, 'name', None)
+        if not file_name:
+            file_name = f"file_{message.id}_{message.date.strftime('%Y%m%d_%H%M%S')}"
+
+    msg = {
+        "id"        : message.id,
+        "date"      : message.date.isoformat(),
+        "raw_text"  : message.raw_text if message.raw_text else "",
+        "text"      : message.text if message.text else "",
+        "sender_id" : message.sender_id,
+        "reactions" : msg_reactions,
+        "total"     : total_filtered_reactions,
+        "has_file"  : has_file,
+        "file_name" : file_name,
+        "audio"     : True if message.audio else False,
+    }
+
+    return msg     
+
+async def get_pinned_message(client: TelegramClient, forum_id: int, topic_id: int):
+    forum_entity = await client.get_entity(int(forum_id))
+
+    async for message in client.iter_messages(forum_entity, reply_to=int(topic_id)):
+        if message.pinned:
+            return msg_from_tgmssage (message,[])
+
+    return None
+
+async def get_messages_from_last_pin_to_end(client: TelegramClient, forum_id: int, topic_id: int, audio_only: bool, reactions: list):
     """
-    Синхронная функция. Получает список закрепленных сообщений в конкретном топике форума.
-    Сохраняет результат в файл data/{forum_id}/{topic_id}/pinned_messages.json и возвращает список.
+    Возвращает сообщения в топике `topic_id` форума `forum_id`
+    от последнего закреплённого сообщения до самого нового.
     """
-    async def _fetch():
-        topic_dir = os.path.join(base_data_dir, str(forum_id), str(topic_id))
-        if not os.path.exists(topic_dir):
-            os.makedirs(topic_dir)
+    messages = []
+    forum_entity = await client.get_entity(int(forum_id))
 
-        print(f"Сбор закрепленных сообщений из топика {topic_id} форума {forum_id}...")
-        pinned_list = []
+    async for message in client.iter_messages(forum_entity, reply_to=int(topic_id)):
+        if message.pinned:
+            break
+        messages.append(msg_from_tgmssage(message,reactions))
 
-        try:
-            forum_entity = await client.get_entity(int(forum_id))
-            
-            # ИСПРАВЛЕНО: Вместо pinned=True в iter_messages (которого не существует),
-            # мы перебираем сообщения в топике и проверяем флаг message.pinned вручную.
-            # Для ускорения процесса можно ограничить общий поиск.
-            async for message in client.iter_messages(forum_entity, reply_to=int(topic_id), limit=limit):
-                
-                # Проверяем, является ли сообщение закрепленным
-                if not getattr(message, 'pinned', False):
-                    continue
+    return messages
 
-                sender_id = None
-                if isinstance(message.from_id, PeerUser):
-                    sender_id = message.from_id.user_id
-                elif isinstance(message.from_id, PeerChannel):
-                    sender_id = message.from_id.channel_id
-                elif isinstance(message.from_id, PeerChat):
-                    sender_id = message.from_id.chat_id
+async def get_messages_all(client: TelegramClient, forum_id: int, topic_id: int, audio_only: bool, reactions: list):
+    """
+    Возвращает сообщения в топике `topic_id` форума `forum_id`
+    от последнего закреплённого сообщения до самого нового.
+    """
+    messages = []
+    forum_entity = await client.get_entity(int(forum_id))
 
-                total_reactions = sum(r.count for r in message.reactions.results) if message.reactions else 0
+    async for message in client.iter_messages(forum_entity, reply_to=int(topic_id)):
+        messages.append(msg_from_tgmssage(message,reactions))
 
-                msg_data = {
-                    "id": message.id,
-                    "date": message.date.isoformat(),
-                    "text": message.text if message.text else "",
-                    "sender_id": sender_id,
-                    "reactions": [],
-                    "total_reactions": total_reactions
-                }
-                pinned_list.append(msg_data)
-                
-        except Exception as e:
-            print(f"[Ошибка] Не удалось получить закрепы: {e}")
-            return []
+    return messages
 
-        output_file = os.path.join(topic_dir, "pinned_messages.json")
-        with open(output_file, "w", encoding="utf-8") as f:
-            json.dump(pinned_list, f, ensure_ascii=False, indent=4)
+async def get_messages_between_pins(
+    client: TelegramClient,
+    forum_id: int,
+    topic_id: int,
+    old_pinned_id: int,
+    new_pinned_id: int,
+    reverse: bool = False,
+    reactions: list = []
+):
+    """
+    Возвращает сообщения в топике `topic_id` форума `forum_id`,
+    находящиеся между двумя закреплёнными сообщениями.
 
-        print(f"[Успешно] Закрепленные сообщения сохранены в: {output_file}")
-        
-        return pinned_list
+    :param old_pinned_id: ID более старого закреплённого сообщения.
+    :param new_pinned_id: ID более нового закреплённого сообщения.
+    :param reverse: если True, сообщения будут возвращены от старых к новым.
+    """
+    forum_entity = await client.get_entity(int(forum_id))
 
-    # Безопасный запуск асинхронного кода внутри синхронной функции
-    try:
-        loop = asyncio.get_running_loop()
-    except RuntimeError:
-        loop = None
+    # ID должны быть упорядочены: min_id < max_id
+    min_id = min(old_pinned_id, new_pinned_id)
+    max_id = max(old_pinned_id, new_pinned_id)
 
-    if loop and loop.is_running():
-        return loop.create_task(_fetch())
+    messages = []
+    async for message in client.iter_messages(
+        forum_entity,
+        reply_to=int(topic_id),   # фильтр по топику (ветке)
+        min_id=min_id,            # исключает сообщения с ID <= min_id
+        #max_id=max_id,            # исключает сообщения с ID >= max_id
+        reverse=reverse            # порядок: по умолчанию от новых к старым
+    ):
+        messages.append(msg_from_tgmssage(message,reactions))
+
+    return messages
+
+async def get_messages_for_period(client: TelegramClient, forum_id: int, topic_id: int, time_filter: str, audio_only: bool, reactions: list):
+    if time_filter == "day":
+        # Сообщения за текущий календарный день (с 00:00)
+        start_date = datetime.datetime.combine(
+            datetime.datetime.now(MSK).date(),
+            time.min,
+            tzinfo=MSK,
+        )    
+    elif time_filter == "week":
+        # Сообщения за последние 7 дней от текущего момента (с 00:00)
+        today_msk = datetime.datetime.now(MSK).date()
+        start_date = datetime.datetime.combine(
+            today_msk - datetime.timedelta(days=7),
+            time.min,
+            tzinfo=MSK,
+        )
+    elif time_filter == "month":
+        # Сообщения за последние 30 дней от текущего момента (с 00:00)
+        today_msk = datetime.datetime.now(MSK).date()
+        start_date = datetime.datetime.combine(
+            today_msk.replace(day=1),
+            time.min,
+            tzinfo=MSK,
+        )
+    elif time_filter == "year":
+        # Сообщения за последние 365 дней от текущего момента
+        today_msk = datetime.datetime.now(MSK).date()
+        start_date = datetime.datetime.combine(
+            today_msk.replace(month=1,day=1),
+            time.min,
+            tzinfo=MSK,
+        )
+    elif time_filter == "all":
+        limit = False
     else:
-        return asyncio.run(_fetch())
+        limit = False
+
+    messages = []
+    forum_entity = await client.get_entity(int(forum_id))
+
+    async for message in client.iter_messages(forum_entity, reply_to=int(topic_id)):
+        if message.date < start_date:
+            break
+        messages.append(msg_from_tgmssage(message,reactions))
+
+    return messages
 
 def fetch_telegram_messages(client, forum_id: str, topic_id: str, pinned_id: str, start_pinned_id:str, time_filter: str, reactions: list, audio_only: bool, limit=50, base_data_dir="data") -> list:
     """
@@ -210,126 +310,52 @@ def fetch_telegram_messages(client, forum_id: str, topic_id: str, pinned_id: str
         if not os.path.exists(topic_dir):
             os.makedirs(topic_dir)
 
-        print(f"Сбор сообщений из топика {topic_id} форума {forum_id} (лимит {limit})...")
+        print(f"Сбор сообщений из топика {topic_id} форума {forum_id}...")
         messages_list = []
+        reactions_list = []
 
         # Вычисляем порог времени на основе переданного фильтра
-        time_threshold = None
+        days = 0
         local_now = datetime.datetime.now()
         local_today_midnight = datetime.datetime.combine(local_now.date(), datetime.time.min)
+        fetch_limit = limit
+
+        print(f"Сбор сообщений из топика {topic_id} форума {forum_id} (лимит {fetch_limit})...")
 
         if time_filter == "pinned":
-            # Сообщения после закрепа
-            time_threshold = None
-        elif time_filter == "day":
-            # Сообщения за текущий календарный день (с 00:00)
-            time_threshold = local_today_midnight.astimezone(datetime.timezone.utc)
-        elif time_filter == "week":
-            # Сообщения за последние 7 дней от текущего момента
-            start_date = local_now - datetime.timedelta(days=7)
-            time_threshold = start_date.astimezone(datetime.timezone.utc)
-        elif time_filter == "month":
-            # Сообщения за последние 30 дней от текущего момента
-            start_date = local_now - datetime.timedelta(days=30)
-            time_threshold = start_date.astimezone(datetime.timezone.utc)
-        elif time_filter == "year":
-            # Сообщения за последние 365 дней от текущего момента
-            start_date = local_now - datetime.timedelta(days=365)
-            time_threshold = start_date.astimezone(datetime.timezone.utc)
+            messages = await get_messages_from_last_pin_to_end(client, forum_id, topic_id, audio_only, reactions)
         elif time_filter == "all":
-            time_threshold = None
+            messages = await get_messages_all(client, forum_id, topic_id, audio_only, reactions)
+        else:
+            messages = await get_messages_for_period(client, forum_id, topic_id, time_filter, audio_only, reactions)
+
+        for msg in messages:
+            # reactions
+            if reactions and msg.get("total",0) == 0:
+                continue
+            # audio
+            if audio_only and msg.get("audio",False) == False:
+                continue
+
+            messages_list.append(msg)
 
         try:
-            forum_entity = await client.get_entity(int(forum_id))
-            
-            async for message in client.iter_messages(forum_entity, reply_to=int(topic_id), limit=limit):
-                # Так как сообщения идут от новых к старым, при выходе за порог прекращаем сбор
-                if time_threshold and message.date < time_threshold:
-                    break
+            pass
 
-                # filter pinned
-                if time_filter == "pinned" and pinned_id and message.id < int(pinned_id):
-                    break
-                if time_filter == "pinned" and pinned_id and message.id != int(pinned_id):
-                    if getattr(message, 'pinned', False):
-                        messages_list.clear()
-
-                # filter audio
-                if audio_only:
-                    is_audio = False
-                    # Проверяем наличие медиа, которое является аудиозаписью или голосовым сообщением
-                    if message.media and getattr(message, 'audio', None):
-                        is_audio = True
-                    # Если в сообщении есть документ, проверяем его mime_type
-                    elif message.document and hasattr(message.document, 'mime_type'):
-                        if message.document.mime_type.startswith('audio/'):
-                            is_audio = True
-
-                    # Если фильтр включен, а аудио не найдено — пропускаем сообщение
-                    if not is_audio:
-                        continue
-
-                # --- ИСПРАВЛЕНО: Безопасное извлечение эмодзи с поддержкой кастомных реакций ---
-                msg_reactions = []
-                if message.reactions and message.reactions.results:
-                    for r in message.reactions.results:
-                        # Проверяем наличие атрибута emoticon (он есть только у ReactionEmoji)
-                        if hasattr(r.reaction, 'emoticon'):
-                            msg_reactions.append(r.reaction.emoticon)
-                        elif hasattr(r.reaction, 'document_id'):
-                            # Для кастомных премиум-эмодзи подставляем заглушку-звездочку
-                            msg_reactions.append("⭐")
-
-                if reactions and not any(react in msg_reactions for react in reactions):
-                    continue
-
-                has_file = False
-                file_name = None
-                if message.media and not message.photo:
-                    has_file = True
-                    file_name = getattr(message.file, 'name', None)
-                    if not file_name:
-                        file_name = f"file_{message.id}_{message.date.strftime('%Y%m%d_%H%M%S')}"
-
-                sender_id = None
-                if isinstance(message.from_id, PeerUser):
-                    sender_id = message.from_id.user_id
-                elif isinstance(message.from_id, PeerChannel):
-                    sender_id = message.from_id.channel_id
-                elif isinstance(message.from_id, PeerChat):
-                    sender_id = message.from_id.chat_id
-
-                if reactions:
-                    total = get_total_reactions (message, reactions)
-                else:
-                    total = sum(r.count for r in message.reactions.results) if message.reactions else 0
-
-                msg_data = {
-                    "id": message.id,
-                    "date": message.date.isoformat(),
-                    "text": message.text if message.text else "",
-                    "sender_id": sender_id,
-                    "pinned_id": pinned_id,
-                    "reactions": msg_reactions,
-                    "has_file": has_file,
-                    "file_name": file_name,
-                    "total": total
-                }
-                messages_list.append(msg_data)
-                
         except Exception as e:
             print(f"[Ошибка] Не удалось получить сообщения по фильтру: {e}")
-            return []
+            return ([],[])
 
-        output_file = os.path.join(topic_dir, "messages.json")
-        with open(output_file, "w", encoding="utf-8") as f:
-            json.dump(messages_list, f, ensure_ascii=False, indent=4)
+#        output_file = os.path.join(topic_dir, "messages.json")
+#        with open(output_file, "w", encoding="utf-8") as f:
+#            json.dump(messages_list, f, ensure_ascii=False, indent=4)
+#
+#        print(f"[Успешно] Отфильтрованные сообщения сохранены в: {output_file}")
 
-        print(f"[Успешно] Отфильтрованные сообщения сохранены в: {output_file}")
-
-        top_10 = sorted(messages_list, key=lambda x: x["total"], reverse=True)
-
-        return top_10
+        return (
+            sorted(messages_list, key=lambda x: x["total"], reverse=True),
+            [],   # пока, например, []
+        )
 
     # Безопасный запуск асинхронного кода внутри обычной синхронной функции
     try:
@@ -343,8 +369,6 @@ def fetch_telegram_messages(client, forum_id: str, topic_id: str, pinned_id: str
     else:
         # Если запускается в синхронном скрипте
         return asyncio.run(_fetch())
-
-        from telethon import TelegramClient, events
 
 def get_total_reactions(message, reactions):
     total_filtered_reactions = 0
@@ -386,7 +410,7 @@ async def main():
                 # ИСПРАВЛЕНО: берём id из первого элемента списка топиков
                 t_id = str(topics[0]["id"])
                 
-                # Вызов новой функции (так как она синхронная, вызываем без await)
+                # Вызов новой функции (так как она синхронная, вызываем без await)                
                 fetch_telegram_messages(
                     client=client,
                     forum_id=f_id,
@@ -394,9 +418,8 @@ async def main():
                     pinned_id="0",
                     start_pinned_id="0",
                     time_filter="all",
-                    audio_only=True,
                     reactions=None,
-                    limit=50
+                    audio_only=True
                 )
 
 if __name__ == '__main__':

@@ -43,12 +43,19 @@ class TelegramPlayerUI:
             expand=True, 
             dense=True
         )
-        self.subject_dropdown = ft.Dropdown(
-            label="Выберите закреп", 
-            hint_text="Нажмите Обновить", 
-            expand=True, 
-            dense=True
+        # ЗАМЕНЕНО: теперь это просто кнопка "Диапазон закрепа" вместо Dropdown
+        # ИСПРАВЛЕНО ДЛЯ FLET 1.0.5: Используем ft.controls.Button
+        self.pinned_tooltip = ft.Tooltip(
+            message="Стилизованная подсказка",
+            bgcolor=ft.Colors.BLUE_GREY_700,
+            text_style=ft.TextStyle(color=ft.Colors.WHITE),
         )
+        self.subject_dropdown = ft.Button(
+            content="Закреп",
+            tooltip=self.pinned_tooltip,
+            on_click=lambda e: self.on_subject_selected_bridge()
+        )
+        self.subject_dropdown.pinned_id = None
         
         self.selected_post_text = ft.Text("Ничего не выбрано", color=ft.Colors.BLUE_400, weight=ft.FontWeight.BOLD, size=12)
         self.loader = ft.ProgressRing(width=20, height=20, stroke_width=3, visible=False)
@@ -158,7 +165,7 @@ class TelegramPlayerUI:
         # 3. ИСПРАВЛЕНО ДЛЯ PYTHON 3.13 & FLET 1.0.5: стабильные лямбда-обертки
         self.forum_dropdown.on_select = lambda e: self.on_forum_selected_bridge()
         self.topic_dropdown.on_select = lambda e: self.on_topic_selected_bridge()
-        self.subject_dropdown.on_select = lambda e: self.on_subject_selected_bridge()
+        self.subject_dropdown.on_click = lambda e: self.on_subject_selected_bridge()
         self.filter_radio_group.on_change = lambda e: self.on_filter_changed_bridge()
 
         for checkbox in reaction_controls:
@@ -196,12 +203,11 @@ class TelegramPlayerUI:
         self.safe_execute(self.on_forum_selected_async())
 
     def on_subject_selected_bridge(self):
-        print("[LOG] Выбран элемент в выпадающем списке закрепов.")
-        # Только если пользователь сам выбрал закреп, переключаем радиокнопку в "pinned"
-        if self.subject_dropdown.value:
-            if self.filter_radio_group.value != "pinned":
-                self.filter_radio_group.value = "pinned"
-                self.filter_radio_group.update()
+        print("[LOG] Нажата кнопка диапазона закрепа.")
+        # Принудительно переключаем радио-фильтр в режим "pinned"
+        if self.filter_radio_group.value != "pinned":
+            self.filter_radio_group.value = "pinned"
+            self.filter_radio_group.update()
                 
         self.safe_execute(self.load_messages_from_telegram())
 
@@ -209,11 +215,6 @@ class TelegramPlayerUI:
         print(f"[LOG] Радио-фильтр изменен мышкой на: {self.filter_radio_group.value}")
         # Если пользователь кликнул на любой временной фильтр (день, неделя и т.д.),
         # сбрасываем визуальный выбор в выпадающем списке закрепов, чтобы не путать интерфейс
-        if self.filter_radio_group.value != "pinned":
-            if self.subject_dropdown.value is not None:
-                self.subject_dropdown.value = None
-                self.subject_dropdown.update()
-                
         self.safe_execute(self.load_messages_from_telegram())
 
     def on_refresh_clicked_bridge(self):
@@ -291,10 +292,7 @@ class TelegramPlayerUI:
             lines.append(line)
 
             # раздел
-            subject_text = next(
-                (opt.text for opt in self.subject_dropdown.options if opt.key == self.subject_dropdown.value), 
-                ""
-            )
+            subject_text = self.subject_dropdown.content
             line = f"{subject_text}"
             lines.append(line)
 
@@ -379,14 +377,12 @@ class TelegramPlayerUI:
             
             if new_options:
                 self.topic_dropdown.value = new_options[0].key
+                await self.load_pinned_message ()
             else:
                 self.topic_dropdown.value = None
                 
             self.topic_dropdown.update()
             self.page.update()
-            
-            # --- ИЗМЕНЕНИЕ: Сначала загружаем закрепы в выпадающий список предметов ---
-            await self.load_subjects_from_pinned()
             
             # Затем загружаем сообщения
             await self.load_messages_from_telegram()
@@ -410,8 +406,7 @@ class TelegramPlayerUI:
         self.loader.visible = True
         self.page.update()
         try:
-            # Сначала загружаем актуальные закрепы для нового топика
-            await self.load_subjects_from_pinned()
+            await self.load_pinned_message ()
             # Затем обновляем основную ленту сообщений
             await self.load_messages_from_telegram()
         except Exception as ex:
@@ -453,9 +448,6 @@ class TelegramPlayerUI:
                 self.forum_dropdown.value = None
                 self.forum_dropdown.update()
                 # --- ИЗМЕНЕНИЕ: Вместо старого конфига сбрасываем состояние предметов ---
-                self.subject_dropdown.options = []
-                self.subject_dropdown.value = None
-                self.subject_dropdown.update()
         except Exception as ex:
             print(f"[UI Critical Error] Ошибка при полном обновлении данных: {ex}")
             traceback.print_exc()
@@ -463,45 +455,25 @@ class TelegramPlayerUI:
             self.loader.visible = False
             self.page.update()
 
-    async def load_subjects_from_pinned(self):
-        """
-        Запрашивает закрепленные сообщения из бэкенда и заполняет ими subject_dropdown.
-        """
-        forum_id = self.forum_dropdown.value
-        topic_id = self.topic_dropdown.value
-        
-        if not forum_id or not topic_id:
-            self.subject_dropdown.options = []
-            self.subject_dropdown.value = None
-            self.subject_dropdown.update()
-            return
+    async def load_pinned_message(self):
+        message = await self.backend.get_pinned_message(
+            forum_id=self.forum_dropdown.value,
+            topic_id=self.topic_dropdown.value
+        )
 
-        print(f"[UI Async] Загрузка закрепленных сообщений для subject_dropdown (Форум: {forum_id}, Топик: {topic_id})...")
-        
-        try:
-            # Вызываем ранее созданную функцию-обертку в backend
-            pinned_messages = await self.backend.fetch_pinned_messages(forum_id=forum_id, topic_id=topic_id)
-            
-            # Формируем опции для Dropdown. 
-            # В key кладем ID закрепленного сообщения, в text — его усеченный заголовок
-            options = [
-                ft.dropdown.Option(key=str(msg.get("id", "")), text=str(msg.get("title", f"Закреп {msg.get('id')}")))
-                for msg in pinned_messages
-            ]
-            
-            self.subject_dropdown.options = options
-            
-            # Выбираем первый элемент по умолчанию, если он есть
-            if options:
-                self.subject_dropdown.value = options[0].key
-            else:
-                self.subject_dropdown.value = None
-                
-            self.subject_dropdown.update()
-            
-        except Exception as ex:
-            print(f"[UI Critical Error] Ошибка заполнения subject_dropdown из закрепов: {ex}")
-            traceback.print_exc()
+        text = message.get("text","")
+        first_line = text.splitlines()[0]
+        title = first_line if len(first_line) < 60 else first_line[:57] + "..."
+        self.subject_dropdown.content = message.get("date","YYYY-MM-DD")[:10] + " " + title
+        raw_text = message.get("raw_text","")
+        self.subject_dropdown.tooltip = ft.Tooltip(
+            message=raw_text,
+            bgcolor=ft.Colors.BLUE_GREY_700,
+            text_style=ft.TextStyle(color=ft.Colors.WHITE),
+        )
+        self.subject_dropdown.update()
+
+        self.subject_dropdown.pinned_id = message.get("id",None)
 
     async def load_messages_from_telegram(self):
         if not self.forum_dropdown.value or not self.topic_dropdown.value:
@@ -513,22 +485,20 @@ class TelegramPlayerUI:
         self.page.update()
         try:
             start_pinned_id = None
-            messages = await self.backend.fetch_telegram_messages(
-                forum_id=self.forum_dropdown.value,
-                topic_id=self.topic_dropdown.value,
-                pinned_id=self.subject_dropdown.value,
-                start_pinned_id=self.subject_dropdown.value,
-                time_filter=self.filter_radio_group.value,
-                reactions=list(self.selected_reactions),
-                audio_only=self.audio_checkbox.value
+            messages,pinned_list = await self.backend.fetch_telegram_messages(
+                forum_id        = self.forum_dropdown.value,
+                topic_id        = self.topic_dropdown.value,
+                pinned_id       = self.subject_dropdown.pinned_id,
+                start_pinned_id = self.subject_dropdown.pinned_id,
+                time_filter     = self.filter_radio_group.value,
+                reactions       = list(self.selected_reactions),
+                audio_only      = self.audio_checkbox.value
             )
+            
+            # messages list
             self.posts_list.controls.clear()
             
             for msg in messages:
-                # --- ИЗМЕНЕНИЕ: Формируем цепочку гарантированно ЦВЕТНЫХ элементов ---
-                # --- СТАБИЛЬНЫЙ ВАРИАНТ ДЛЯ FLET 1.0.5+ (ПОЗИЦИОННЫЙ АРГУМЕНТ) ---
-                # --- ИСПРАВЛЕНО ДЛЯ FLET 1.0.5+: Использование классов Padding и Alignment ---
-                # --- ОБНОВЛЕННЫЙ ЦИКЛ: РЕНДЕР ОФИЦИАЛЬНЫХ ТЕЛЕГРАМ-ЭМОДЗИ ---
                 reaction_controls = []
                 for emoji in msg.get('reactions', []):
                     clean_emoji = emoji.strip()
