@@ -4,3 +4,9 @@ distr/
 config.py
 session_faketls.session
 messages.txt
+build
+mp3/
+mp4/
+backup/
+dist/
+main.spec
