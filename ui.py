@@ -68,7 +68,7 @@ class TelegramPlayerUI:
             alignment=ft.MainAxisAlignment.CENTER,
             visible=False 
         )        
-        self.posts_list = ft.ListView(expand=True, spacing=2, height=350) 
+        self.posts_list = ft.ListView(expand=True, spacing=2, height=300) 
 
         # === НОВОЕ: кнопка Download ===
         self.download_btn = ft.Button(
@@ -500,7 +500,7 @@ class TelegramPlayerUI:
         try:
             # Собираем данные из текущего ListView
             messages = [
-                control.data
+                control.data.get("id", "N/A")
                 for control in self.posts_list.controls
                 if isinstance(control, ft.ListTile) and control.data
             ]
@@ -509,11 +509,9 @@ class TelegramPlayerUI:
             # Вызываем backend, если у него есть соответствующий метод
             if hasattr(self.backend, "download_tracks"):
                 await self.backend.download_tracks(
-                    forum_id   = self.forum_dropdown.value,
-                    topic_id   = self.topic_dropdown.value,
-                    messages   = messages,
-                    reactions  = list(self.selected_reactions),
-                    audio_only = self.audio_checkbox.value,
+                    forum_id    = self.forum_dropdown.value,
+                    topic_id    = self.topic_dropdown.value,
+                    messages    = messages
                 )
             else:
                 print("[UI Warning] backend.download_tracks не реализован — заглушка.")

@@ -140,7 +140,13 @@ class TelegramBackend:
 
         return (ui_mapped_messages,pinned_list)
 
-    async def download_tracks (self, forum_id, topic_id, messages, reactions, audio_only):
-        pass
+    async def download_tracks (self, forum_id, topic_id, messages):
+        res = await tg_backend.download_tracks(
+                    client=self.client,
+                    forum_id=forum_id,
+                    topic_id=topic_id,
+                    messages=messages
+                )
+        return res
 
 

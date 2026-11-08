@@ -252,7 +252,10 @@ async def get_messages_between_pins(
 
     return messages
 
-async def get_messages_for_period(client: TelegramClient, forum_id: int, topic_id: int, time_filter: str, audio_only: bool, reactions: list):
+def get_time_threshold (time_filter):
+    start_date = None
+    limit = None
+
     if time_filter == "day":
         # Сообщения за текущий календарный день (с 00:00)
         start_date = datetime.datetime.combine(
@@ -288,6 +291,11 @@ async def get_messages_for_period(client: TelegramClient, forum_id: int, topic_i
         limit = False
     else:
         limit = False
+
+    return (start_date,limit)
+
+async def get_messages_for_period(client: TelegramClient, forum_id: int, topic_id: int, time_filter: str, audio_only: bool, reactions: list):
+    start_date, limit = get_time_threshold (time_filter)
 
     messages = []
     forum_entity = await client.get_entity(int(forum_id))
@@ -393,6 +401,69 @@ def get_total_reactions(message, reactions):
     print(f"Всего подходящих реакций: {total_filtered_reactions}")
     return total_filtered_reactions
 
+async def fetch_one_message(client, forum_id, topic_id, id):
+    """
+    Извлекает одно сообщение по его ID из указанного топика форума.
+    
+    :param client:      активированный TelegramClient
+    :param forum_id:    ID форума (канала)
+    :param topic_id:    ID топика (ветки) — используется для верификации
+    :param id:          ID сообщения
+    :return:            объект сообщения Telethon или None
+    """
+    try:
+        forum_entity = await client.get_entity(int(forum_id))
+        message = await client.get_messages(forum_entity, ids=int(id))
+
+        # client.get_messages с ids возвращает объект или None
+        if message is None:
+            print(f"[Warning] Сообщение {id} не найдено в форуме {forum_id}.")
+            return None
+
+        # Дополнительная проверка принадлежности к топику (для форумов)
+        # у сообщений внутри топика reply_to.reply_to_top_id == topic_id
+        if topic_id:
+            reply = getattr(message, "reply_to", None)
+            top_id = getattr(reply, "reply_to_top_id", None) if reply else None
+            if top_id is not None and int(top_id) != int(topic_id):
+                print(f"[Warning] Сообщение {id} не принадлежит топику {topic_id}.")
+                return None
+
+        return message
+
+    except Exception as e:
+        print(f"[Ошибка] Не удалось получить сообщение {id}: {e}")
+        return None
+
+async def download_tracks (client, forum_id, topic_id, messages):
+    if not os.path.exists(config.OUTPUT_DIR):
+        os.makedirs(config.OUTPUT_DIR)
+
+    # --- Шаг скачивания файлов из конкретного топика ---
+    # Передаем topic_id в параметр reply_to для фильтрации по разделу
+    for id in messages:
+        message = await fetch_one_message (client, forum_id, topic_id, id)
+
+        if message is None:
+            print(f"[Пропуск] Сообщение {id} не получено.")
+            continue
+
+        if message.media and not message.photo:
+            filename = getattr(message.file, 'name', None)
+            if not filename:
+                filename = f"file_{message.id}_{message.date.strftime('%Y%m%d_%H%M%S')}"
+            
+            file_path = os.path.join(config.OUTPUT_DIR, filename)
+            msg_local_time = message.date.astimezone()
+            print(f"Найдено в {msg_local_time.strftime('%H:%M:%S')}. Скачивание: {filename}...")
+            
+            try:
+                await client.download_media(message, file=file_path)
+                print(f"[Успешно] Сохранено: {filename}")
+                await asyncio.sleep(1.5)
+            except Exception as e:
+                print(f"[Ошибка] Не удалось скачать {filename}: {e}")
+
 
 # Блок для проверки автономного запуска
 async def main():
@@ -421,6 +492,7 @@ async def main():
                     reactions=None,
                     audio_only=True
                 )
+
 
 if __name__ == '__main__':
     asyncio.run(main())
