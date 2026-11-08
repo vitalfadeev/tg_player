@@ -183,7 +183,7 @@ def msg_from_tgmssage(message,reactions):
 async def get_pinned_message(client: TelegramClient, forum_id: int, topic_id: int):
     forum_entity = await client.get_entity(int(forum_id))
 
-    async for message in client.iter_messages(forum_entity, reply_to=int(topic_id)):
+    async for message in client.iter_messages(forum_entity, reply_to=int(topic_id), limit=1000):
         if message.pinned:
             return msg_from_tgmssage (message,[])
 

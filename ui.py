@@ -70,6 +70,12 @@ class TelegramPlayerUI:
         )        
         self.posts_list = ft.ListView(expand=True, spacing=2, height=350) 
 
+        # === НОВОЕ: кнопка Download ===
+        self.download_btn = ft.Button(
+            "Download",
+            on_click=lambda e: self.on_download_clicked_bridge()
+        )        
+
         top_row = ft.Row(
             controls=[self.forum_dropdown, self.topic_dropdown],
             alignment=ft.MainAxisAlignment.START,
@@ -159,7 +165,12 @@ class TelegramPlayerUI:
                 ], 
                 alignment=ft.MainAxisAlignment.SPACE_BETWEEN
             ),
-            self.posts_list
+            self.posts_list,
+            # === НОВОЕ: строка под ListView с кнопкой справа ===
+            ft.Row(
+                controls=[self.download_btn],
+                alignment=ft.MainAxisAlignment.END,
+            ),
         )
 
         # 3. ИСПРАВЛЕНО ДЛЯ PYTHON 3.13 & FLET 1.0.5: стабильные лямбда-обертки
@@ -237,6 +248,10 @@ class TelegramPlayerUI:
     def on_audio_changed_bridge(self):
         print(f"[LOG] Фильтр audio изменен на: {self.audio_checkbox.value}")
         self.safe_execute(self.load_messages_from_telegram())
+
+    def on_download_clicked_bridge(self):
+        print("[LOG] Клик по кнопке 'Download'.")
+        self.safe_execute(self.download_tracks())
 
     # =========================================================================
     # АСИНХРОННАЯ БИЗНЕС-ЛОГИКА
@@ -416,6 +431,107 @@ class TelegramPlayerUI:
             self.loader.visible = False
             self.page.update()
 
+            async def download_tracks(self):
+                """
+                Запускает загрузку треков по текущему контексту UI:
+                форум + топик + сообщения из posts_list + текущие фильтры.
+                """
+                print("[UI Async] Запуск download_tracks...")
+
+                if not self.forum_dropdown.value or not self.topic_dropdown.value:
+                    print("[UI Warning] Не выбраны форум или топик — загрузка отменена.")
+                    self.selected_post_text.value = "Download: не выбран форум/топик"
+                    self.page.update()
+                    return
+
+                self.loader.visible = True
+                self.page.update()
+
+                try:
+                    # Собираем данные из текущего ListView
+                    messages = [
+                        control.data
+                        for control in self.posts_list.controls
+                        if isinstance(control, ft.ListTile) and control.data
+                    ]
+                    print(f"[UI Async] Сообщений для загрузки: {len(messages)}")
+
+                    # Вызываем backend, если у него есть соответствующий метод
+                    if hasattr(self.backend, "download_tracks"):
+                        await self.backend.download_tracks(
+                            forum_id   = self.forum_dropdown.value,
+                            topic_id   = self.topic_dropdown.value,
+                            messages   = messages,
+                            reactions  = list(self.selected_reactions),
+                            audio_only = self.audio_checkbox.value,
+                        )
+                    else:
+                        print("[UI Warning] backend.download_tracks не реализован — заглушка.")
+
+                    self.selected_post_text.value = f"Download: {len(messages)} постов"
+                    self.page.update()
+
+                except asyncio.CancelledError:
+                    print("[UI Async] download_tracks отменён.")
+                    raise
+                except Exception as ex:
+                    print(f"[UI Critical Error] Ошибка в download_tracks: {ex}")
+                    traceback.print_exc()
+                finally:
+                    self.loader.visible = False
+                    self.page.update()
+
+    async def download_tracks(self):
+        """
+        Запускает загрузку треков по текущему контексту UI:
+        форум + топик + сообщения из posts_list + текущие фильтры.
+        """
+        print("[UI Async] Запуск download_tracks...")
+
+        if not self.forum_dropdown.value or not self.topic_dropdown.value:
+            print("[UI Warning] Не выбраны форум или топик — загрузка отменена.")
+            self.selected_post_text.value = "Download: не выбран форум/топик"
+            self.page.update()
+            return
+
+        self.loader.visible = True
+        self.page.update()
+
+        try:
+            # Собираем данные из текущего ListView
+            messages = [
+                control.data
+                for control in self.posts_list.controls
+                if isinstance(control, ft.ListTile) and control.data
+            ]
+            print(f"[UI Async] Сообщений для загрузки: {len(messages)}")
+
+            # Вызываем backend, если у него есть соответствующий метод
+            if hasattr(self.backend, "download_tracks"):
+                await self.backend.download_tracks(
+                    forum_id   = self.forum_dropdown.value,
+                    topic_id   = self.topic_dropdown.value,
+                    messages   = messages,
+                    reactions  = list(self.selected_reactions),
+                    audio_only = self.audio_checkbox.value,
+                )
+            else:
+                print("[UI Warning] backend.download_tracks не реализован — заглушка.")
+
+            self.selected_post_text.value = f"Download: {len(messages)} постов"
+            self.page.update()
+
+        except asyncio.CancelledError:
+            print("[UI Async] download_tracks отменён.")
+            raise
+        except Exception as ex:
+            print(f"[UI Critical Error] Ошибка в download_tracks: {ex}")
+            traceback.print_exc()
+        finally:
+            self.loader.visible = False
+            self.page.update()
+
+
     def update_dropdown_options(self, dropdown_component, file_name):
         try:
             data = self.backend.load_json_config(file_name)
@@ -461,19 +577,24 @@ class TelegramPlayerUI:
             topic_id=self.topic_dropdown.value
         )
 
-        text = message.get("text","")
-        first_line = text.splitlines()[0]
-        title = first_line if len(first_line) < 60 else first_line[:57] + "..."
-        self.subject_dropdown.content = message.get("date","YYYY-MM-DD")[:10] + " " + title
-        raw_text = message.get("raw_text","")
-        self.subject_dropdown.tooltip = ft.Tooltip(
-            message=raw_text,
-            bgcolor=ft.Colors.BLUE_GREY_700,
-            text_style=ft.TextStyle(color=ft.Colors.WHITE),
-        )
-        self.subject_dropdown.update()
+        if message:
+            text = message.get("text","")
+            first_line = text.splitlines()[0]
+            title = first_line if len(first_line) < 60 else first_line[:57] + "..."
+            self.subject_dropdown.content = message.get("date","YYYY-MM-DD")[:10] + " " + title
+            raw_text = message.get("raw_text","")
+            self.subject_dropdown.tooltip = ft.Tooltip(
+                message=raw_text,
+                bgcolor=ft.Colors.BLUE_GREY_700,
+                text_style=ft.TextStyle(color=ft.Colors.WHITE),
+            )
+            self.subject_dropdown.update()
 
-        self.subject_dropdown.pinned_id = message.get("id",None)
+            self.subject_dropdown.pinned_id = message.get("id",None)
+        else:
+            self.subject_dropdown.content = ""
+            self.subject_dropdown.tooltip.message = ""
+            self.subject_dropdown.pinned_id = None
 
     async def load_messages_from_telegram(self):
         if not self.forum_dropdown.value or not self.topic_dropdown.value:

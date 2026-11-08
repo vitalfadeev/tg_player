@@ -139,3 +139,8 @@ class TelegramBackend:
             ui_mapped_messages.append(mapped_msg)
 
         return (ui_mapped_messages,pinned_list)
+
+    async def download_tracks (self, forum_id, topic_id, messages, reactions, audio_only):
+        pass
+
+
