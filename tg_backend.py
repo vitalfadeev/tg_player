@@ -1,4 +1,5 @@
 import os
+import re
 import json
 import asyncio
 import datetime
@@ -13,6 +14,192 @@ MSK = ZoneInfo("Europe/Moscow")
 
 # Импортируем настройки из созданного файла config.py
 import config
+
+_AUDIO_MIME_EXT = {
+    "audio/mpeg": ".mp3",
+    "audio/mp3": ".mp3",
+    "audio/mp4": ".m4a",
+    "audio/x-m4a": ".m4a",
+    "audio/m4a": ".m4a",
+    "audio/ogg": ".ogg",
+    "audio/opus": ".opus",
+    "audio/flac": ".flac",
+    "audio/x-flac": ".flac",
+    "audio/wav": ".wav",
+    "audio/x-wav": ".wav",
+    "audio/aac": ".aac",
+}
+
+def _has_image(message) -> bool:
+    """Фото (message.photo) либо документ с MIME image/*."""
+    if getattr(message, "photo", None):
+        return True
+    file = getattr(message, "file", None)
+    if file is not None:
+        mime = getattr(file, "mime_type", None)
+        if mime and mime.startswith("image/"):
+            return True
+    return False
+
+def _sanitize_filename(name: str) -> str:
+    """Убирает из имени символы, недопустимые в именах файлов на большинстве ФС."""
+    if not name:
+        return ""
+    cleaned = re.sub(r'[\\/:*?"<>|\r\n\t]+', '_', str(name)).strip()
+    cleaned = re.sub(r'_+', '_', cleaned)   # схлопываем повторные подчёркивания
+    return cleaned
+
+
+async def _get_author_name(client, message, cache: dict) -> str:
+    """
+    Возвращает безопасное для ФС имя автора сообщения.
+    Кэширует результат по sender_id / from_id, чтобы не дёргать сеть
+    повторно для нескольких сообщений одного автора в одном пакете.
+    """
+    # Ключ кэша
+    key = message.sender_id
+    if key is None:
+        from_id = getattr(message, "from_id", None)
+        if from_id is not None:
+            uid = getattr(from_id, "user_id", None)
+            if uid is not None:
+                key = uid
+            else:
+                cid = getattr(from_id, "channel_id", None)
+                if cid is not None:
+                    key = f"ch_{cid}"
+
+    if key is not None and key in cache:
+        return cache[key]
+
+    # 1) Пытаемся получить отправителя через сам Message (Telethon ≥ 1.24)
+    sender = None
+    try:
+        if hasattr(message, "get_sender"):
+            sender = await message.get_sender()
+    except Exception:
+        sender = None
+
+    # 2) Fallback — через client.get_entity
+    if sender is None and message.sender_id is not None:
+        try:
+            sender = await client.get_entity(message.sender_id)
+        except Exception:
+            sender = None
+
+    author_name = None
+    if sender is not None:
+        # Каналы/группы — title; пользователи — first/last или username
+        title = getattr(sender, "title", None)
+        if title:
+            author_name = title
+        else:
+            first = getattr(sender, "first_name", None) or ""
+            last  = getattr(sender, "last_name",  None) or ""
+            full  = f"{first} {last}".strip()
+            if full:
+                author_name = full
+            elif getattr(sender, "username", None):
+                author_name = sender.username
+
+    if not author_name:
+        author_name = f"user_{message.sender_id}" if message.sender_id is not None else "unknown"
+
+    safe = _sanitize_filename(author_name) or "unknown"
+    if key is not None:
+        cache[key] = safe
+    return safe
+
+def _fmt_duration(sec) -> str:
+    """Форматирует длительность в 'MM:SS (SS.mmm сек)'. None → 'n/a'."""
+    if sec is None:
+        return "n/a"
+    total = int(round(sec))
+    m, s = divmod(total, 60)
+    return f"{m:02d}:{s:02d} ({sec:.3f} сек)"
+
+
+def _read_audio_meta(path) -> tuple[float | None, list[str]]:
+    """
+    Читает длительность и WXXX-ссылки из аудиофайла.
+
+    WXXX — «user defined URL link frame» в ID3v2 (обычно mp3); для не-ID3
+    форматов (ogg/m4a/flac с vorbis-комментариями) список пустой.
+
+    Порядок определения длительности:
+      1) mutagen.File(...).info.length (любой формат: mp3/ogg/m4a/flac/...);
+      2) если mutagen недоступен/не смог — ffprobe format.duration.
+
+    :return: (duration_sec: float|None, wxxx_list: list[str])
+    """
+    duration = None
+    wxxx_links: list[str] = []
+
+    # --- 1. mutagen: длительность + WXXX ---
+    try:
+        from mutagen import File as MutagenFile
+        from mutagen.id3 import ID3
+        audio = MutagenFile(path)
+        if audio is not None:
+            info = getattr(audio, "info", None)
+            if info is not None:
+                length = getattr(info, "length", None)
+                if (isinstance(length, (int, float))
+                        and length > 0
+                        and length == length            # отсекаем NaN
+                        and length != float("inf")):    # и inf
+                    duration = float(length)
+            tags = getattr(audio, "tags", None)
+            if isinstance(tags, ID3):
+                for frame in tags.getall("WXXX"):
+                    url = getattr(frame, "url", None)
+                    desc = getattr(frame, "desc", "") or ""
+                    if url:
+                        wxxx_links.append(f"{desc}: {url}" if desc else str(url))
+    except ImportError:
+        pass   # mutagen не установлен — пойдём через ffprobe
+    except Exception as e:
+        print(f"[Warning] mutagen не прочитал {path}: {e}")
+
+    # --- 2. Fallback: ffprobe для длительности ---
+    if duration is None:
+        try:
+            import subprocess
+            res = subprocess.run(
+                ["ffprobe", "-v", "error",
+                 "-show_entries", "format=duration",
+                 "-of", "default=noprint_wrappers=1:nokey=1",
+                 str(path)],
+                check=False, capture_output=True, text=True,
+                stdin=subprocess.DEVNULL, timeout=30,
+            )
+            if res.returncode == 0:
+                val = res.stdout.strip()
+                if val and val != "N/A":
+                    d = float(val)
+                    if d > 0 and d == d and d != float("inf"):
+                        duration = d
+        except Exception as e:
+            print(f"[Warning] ffprobe не прочитал {path}: {e}")
+
+    return duration, wxxx_links
+
+
+def _make_tg_link(forum_username, forum_id, topic_id, message_id) -> str:
+    """
+    Строит tg:// ссылку на сообщение в топике.
+
+    * Публичный канал (есть username) — tg://resolve?domain=…&thread=…&post=…
+    * Приватный (нет username) — tg://privatepost?channel=…&post=…
+      (у privatepost нет thread; топик теряется, но сообщение открывается).
+    """
+    if forum_username:
+        return (f"tg://resolve?domain={forum_username}"
+                f"&thread={topic_id}&post={message_id}")
+    raw = str(forum_id)
+    channel = raw[4:] if raw.startswith("-100") else raw.lstrip("-")
+    return f"tg://privatepost?channel={channel}&post={message_id}"
+
 
 def login(session_name='session_faketls',proxy_mode='mtproto'):
     """
@@ -434,6 +621,574 @@ async def fetch_one_message(client, forum_id, topic_id, id):
     except Exception as e:
         print(f"[Ошибка] Не удалось получить сообщение {id}: {e}")
         return None
+
+async def get_message_by_id(client: TelegramClient, forum_id: int, topic_id: int, message_id: int):
+    """
+    Возвращает одно сообщение по его ID из указанного топика форума.
+    Тонкая обёртка над fetch_one_message (единое именование trio-функций).
+
+    :param client:      активированный TelegramClient
+    :param forum_id:    ID форума (канала)
+    :param topic_id:    ID топика (ветки)
+    :param message_id:  ID сообщения
+    :return:            объект сообщения Telethon или None
+    """
+    return await fetch_one_message(client, forum_id, topic_id, message_id)
+
+
+async def get_previous_message_from_same_author(
+    client: TelegramClient,
+    forum_id: int,
+    topic_id: int,
+    message_id: int,
+):
+    """
+    Возвращает ближайшее более СТАРОЕ сообщение в том же топике
+    от того же автора, что и сообщение с message_id.
+
+    Поиск идёт от message_id назад (max_id = message_id, default order = от новых к старым),
+    поэтому первое найденное сообщение от того же sender_id — самое близкое по времени.
+
+    :return: объект сообщения Telethon или None (если не найдено / исходное сообщение отсутствует)
+    """
+    try:
+        limit = 1
+        original = await fetch_one_message(client, forum_id, topic_id, message_id)
+        if original is None:
+            return None
+
+        sender_id = original.sender_id
+        if sender_id is None:
+            return None
+
+        forum_entity = await client.get_entity(int(forum_id))
+
+        async for message in client.iter_messages(
+            forum_entity,
+            reply_to=int(topic_id),
+            max_id=int(message_id),   # только сообщения с ID < message_id (более старые)
+        ):
+            if message.sender_id == sender_id:
+                return message
+
+            limit -= 1
+            if limit == 0:
+                break
+
+        return None
+    except Exception as e:
+        print(f"[Ошибка] get_previous_message_from_same_author({message_id}): {e}")
+        return None
+
+
+async def get_next_message_from_same_author(
+    client: TelegramClient,
+    forum_id: int,
+    topic_id: int,
+    message_id: int,
+):
+    """
+    Возвращает ближайшее более НОВОЕ сообщение в том же топике
+    от того же автора, что и сообщение с message_id.
+
+    Поиск идёт от message_id вперёд (min_id = message_id, reverse=True = от старых к новым),
+    поэтому первое найденное сообщение от того же sender_id — самое близкое по времени.
+
+    :return: объект сообщения Telethon или None (если не найдено / исходное сообщение отсутствует)
+    """
+    try:
+        limit = 1
+        original = await fetch_one_message(client, forum_id, topic_id, message_id)
+        if original is None:
+            return None
+
+        sender_id = original.sender_id
+        if sender_id is None:
+            return None
+
+        forum_entity = await client.get_entity(int(forum_id))
+
+        async for message in client.iter_messages(
+            forum_entity,
+            reply_to=int(topic_id),
+            min_id=int(message_id),   # только сообщения с ID > message_id (более новые)
+            reverse=True,             # от старых к новым
+        ):
+            if message.sender_id == sender_id:
+                return message
+
+            limit -= 1
+            if limit == 0:
+                break
+
+        return None
+    except Exception as e:
+        print(f"[Ошибка] get_next_message_from_same_author({message_id}): {e}")
+        return None
+
+
+async def download_audios_and_images_by_ids(
+    client: TelegramClient,
+    forum_id: int,
+    topic_id: int,
+    message_ids: list,
+):
+    """
+    Для каждого ID из `message_ids`:
+      0. (ПЕРЕД ЦИКЛОМ) Удаляет все файлы из config.OUTPUT_DIR.
+      1. Скачивает аудио в config.OUTPUT_DIR под именем NN<ext_аудио>.
+      2. Ищет соседнее медиа того же автора (картинка → видео/GIF).
+      3. Кладёт рядом текстовый файл NN.txt:
+           id, автор, ссылка tg://, имя аудио, длина (MM:SS), картинка, видео,
+           WXXX-ссылки из ID3v2.
+      4. Все файлы перезаписываются.
+
+    :return: [{"message_id", "seq", "audio_path", "image_path",
+               "video_path", "txt_path", "duration_sec", "wxxx"}, ...]
+    """
+    if not os.path.exists(config.OUTPUT_DIR):
+        os.makedirs(config.OUTPUT_DIR, exist_ok=True)
+    else:
+        # ---- 0. Полная очистка каталога от файлов ----
+        removed_files = 0
+        failed_files = 0
+        try:
+            for entry in os.listdir(config.OUTPUT_DIR):
+                fp = os.path.join(config.OUTPUT_DIR, entry)
+                if os.path.isfile(fp) or os.path.islink(fp):
+                    try:
+                        os.remove(fp)
+                        removed_files += 1
+                    except Exception as e:
+                        failed_files += 1
+                        print(f"[Ошибка] Не удалось удалить {fp}: {e}")
+            if removed_files or failed_files:
+                print(f"[Инфо] Удалено файлов: {removed_files}"
+                      + (f", не удалось: {failed_files}" if failed_files else ""))
+            else:
+                print("[Инфо] Каталог уже был пуст (файлов нет).")
+        except Exception as e:
+            print(f"[Ошибка] Не удалось очистить каталог {config.OUTPUT_DIR}: {e}")
+
+    # ---- Username форума один раз (для tg:// ссылок) ----
+    forum_username = None
+    try:
+        _forum_entity = await client.get_entity(int(forum_id))
+        forum_username = getattr(_forum_entity, "username", None)
+    except Exception as e:
+        print(f"[Warning] Не удалось получить данные форума {forum_id}: {e}")
+
+    results = []
+    author_cache = {}
+
+    for idx, message_id in enumerate(message_ids, start=1):
+        seq = f"{idx:02d}"
+        report = {
+            "message_id": message_id,
+            "seq": seq,
+            "audio_path": None,
+            "image_path": None,
+            "video_path": None,
+            "txt_path": None,
+            "duration_sec": None,
+            "wxxx": [],
+        }
+
+        # ---- 1. Исходное сообщение ----
+        message = await fetch_one_message(client, forum_id, topic_id, message_id)
+        if message is None:
+            print(f"[Пропуск] Сообщение {message_id} не получено.")
+            results.append(report)
+            continue
+
+        if not message.audio:
+            print(f"[Пропуск] В сообщении {message_id} нет аудио.")
+            results.append(report)
+            continue
+
+        author = await _get_author_name(client, message, author_cache)
+
+        # ---- Расширение аудио ----
+        raw_audio_name = getattr(message.file, "name", None) if message.file else None
+        audio_stem = ""
+        audio_ext = ""
+        if raw_audio_name:
+            stem, ext = os.path.splitext(raw_audio_name)
+            audio_stem = stem or raw_audio_name
+            audio_ext = ext or ""
+        else:
+            audio_stem = f"audio_{message.id}_{message.date.strftime('%Y%m%d_%H%M%S')}"
+
+        if not audio_ext:
+            mime = (getattr(message.file, "mime_type", None) or "") if message.file else ""
+            audio_ext = _AUDIO_MIME_EXT.get(mime, "")
+        if not audio_ext:
+            audio_ext = ".mp3"
+
+        audio_name = f"{seq}{audio_ext}"
+        audio_path = os.path.join(config.OUTPUT_DIR, audio_name)
+
+        if os.path.exists(audio_path):
+            try:
+                os.remove(audio_path)
+            except Exception as e:
+                print(f"[Ошибка] Не удалось удалить {audio_path}: {e}")
+                results.append(report)
+                continue
+
+        msg_local_time = message.date.astimezone()
+        print(f"Найдено в {msg_local_time.strftime('%H:%M:%S')}. "
+              f"Скачивание аудио: {audio_name}...")
+        try:
+            downloaded = await client.download_media(message, file=audio_path)
+            print(f"[Успешно] Аудио сохранено: {downloaded}")
+            report["audio_path"] = downloaded
+        except Exception as e:
+            print(f"[Ошибка] Не удалось скачать аудио {audio_name}: {e}")
+            results.append(report)
+            continue
+
+        # ---- Длительность + WXXX из скачанного аудио ----
+        audio_duration, wxxx_links = _read_audio_meta(audio_path)
+        report["duration_sec"] = audio_duration
+        report["wxxx"] = wxxx_links
+        if audio_duration is not None:
+            print(f"   длительность: {_fmt_duration(audio_duration)}")
+        if wxxx_links:
+            print(f"   WXXX: {len(wxxx_links)} ссылк(и)")
+
+        # ---- 2. Соседняя картинка → если нет, то видео/GIF ----
+        media_msg = None
+        media_kind = None
+
+        try:
+            img_msg = await get_image_message_from_same_author(
+                client=client, forum_id=forum_id,
+                topic_id=topic_id, message_id=message_id, prefer="any",
+            )
+        except Exception as e:
+            print(f"[Ошибка] Поиск картинки для {message_id}: {e}")
+            img_msg = None
+
+        if img_msg is not None:
+            media_msg, media_kind = img_msg, "image"
+        else:
+            try:
+                vid_msg = await get_video_message_from_same_author(
+                    client=client, forum_id=forum_id,
+                    topic_id=topic_id, message_id=message_id, prefer="any",
+                )
+            except Exception as e:
+                print(f"[Ошибка] Поиск видео/GIF для {message_id}: {e}")
+                vid_msg = None
+            if vid_msg is not None:
+                media_msg, media_kind = vid_msg, "video"
+
+        image_filename = None
+        video_filename = None
+
+        if media_msg is None:
+            print(f"[Инфо] Соседней картинки/видео для сообщения {message_id} не найдено.")
+        else:
+            if media_kind == "image":
+                media_ext = ".jpg"
+                if not getattr(media_msg, "photo", None) and getattr(media_msg, "file", None):
+                    mime = getattr(media_msg.file, "mime_type", None) or ""
+                    if mime.startswith("image/"):
+                        media_ext = "." + mime.split("/", 1)[1].split(";")[0].strip()
+                    else:
+                        src_name = getattr(media_msg.file, "name", None)
+                        if src_name and "." in src_name:
+                            media_ext = "." + src_name.rsplit(".", 1)[1]
+            else:
+                media_ext = ""
+                if getattr(media_msg, "file", None):
+                    mime = getattr(media_msg.file, "mime_type", None) or ""
+                    if mime.startswith("video/"):
+                        media_ext = "." + mime.split("/", 1)[1].split(";")[0].strip()
+                    elif mime == "image/gif":
+                        media_ext = ".gif"
+                if not media_ext and getattr(media_msg, "file", None):
+                    src_name = getattr(media_msg.file, "name", None)
+                    if src_name and "." in src_name:
+                        media_ext = "." + src_name.rsplit(".", 1)[1]
+                if not media_ext:
+                    media_ext = ".mp4"
+
+            media_name = f"{seq}{media_ext}"
+            media_path = os.path.join(config.OUTPUT_DIR, media_name)
+
+            if os.path.exists(media_path):
+                try:
+                    os.remove(media_path)
+                except Exception as e:
+                    print(f"[Ошибка] Не удалось удалить {media_path}: {e}")
+                    media_msg = None
+
+            if media_msg is not None:
+                kind_label = "картинки" if media_kind == "image" else "видео/GIF"
+                media_local_time = media_msg.date.astimezone()
+                print(f"Найдено в {media_local_time.strftime('%H:%M:%S')}. "
+                      f"Скачивание {kind_label}: {media_name}...")
+                try:
+                    downloaded_media = await client.download_media(media_msg, file=media_path)
+                    if media_kind == "image":
+                        print(f"[Успешно] Картинка сохранена: {downloaded_media}")
+                        report["image_path"] = downloaded_media
+                        image_filename = media_name
+                    else:
+                        print(f"[Успешно] Видео/GIF сохранено: {downloaded_media}")
+                        report["video_path"] = downloaded_media
+                        video_filename = media_name
+                except Exception as e:
+                    print(f"[Ошибка] Не удалось скачать {media_name}: {e}")
+
+        # ---- 3. Текстовый сайдкар NN.txt ----
+        tg_link = _make_tg_link(forum_username, forum_id, topic_id, message_id)
+        txt_name = f"{seq}.txt"
+        txt_path = os.path.join(config.OUTPUT_DIR, txt_name)
+        try:
+            with open(txt_path, "w", encoding="utf-8") as f:
+                f.write(f"id сообщения: {message_id}\n")
+                f.write(f"автор: {author}\n")
+                f.write(f"ссылка: {tg_link}\n")
+                f.write(f"аудио: {raw_audio_name or (audio_stem + audio_ext)}\n")
+                f.write(f"длина: {_fmt_duration(audio_duration)}\n")
+                f.write(f"картинка: {image_filename or '-'}\n")
+                f.write(f"видео: {video_filename or '-'}\n")
+                if wxxx_links:
+                    for wxxx in wxxx_links:
+                        f.write(f"WXXX: {wxxx}\n")
+                else:
+                    f.write("WXXX: -\n")
+            report["txt_path"] = txt_path
+            print(f"[Успешно] Текстовый файл сохранён: {txt_path}")
+        except Exception as e:
+            print(f"[Ошибка] Не удалось записать {txt_path}: {e}")
+
+        results.append(report)
+        await asyncio.sleep(1.5)
+
+    return results
+
+            
+async def get_image_message_from_same_author(
+    client: TelegramClient,
+    forum_id: int,
+    topic_id: int,
+    message_id: int,
+    prefer: str = "any",   # "any" | "previous" | "next"
+):
+    """
+    Проверяет только ДВУХ непосредственных соседей сообщения message_id в топике:
+      - сообщение с ID, идущее на 1 выше (более старое),
+      - сообщение с ID, идущее на 1 ниже (более новое).
+    Возвращает того соседа, который одновременно:
+      * от того же автора, что и message_id,
+      * содержит картинку (фото или image/*-документ).
+
+    :param prefer: "any"      — вернуть любого подходящего соседа (сначала проверяется верхний);
+                   "previous" — смотреть только верхнего соседа (1 вверх);
+                   "next"     — смотреть только нижнего соседа (1 вниз).
+    :return:       объект сообщения Telethon или None.
+    """
+    try:
+        original = await fetch_one_message(client, forum_id, topic_id, message_id)
+        if original is None:
+            return None
+
+        sender_id = original.sender_id
+        if sender_id is None:
+            return None
+
+        forum_entity = await client.get_entity(int(forum_id))
+        mid = int(message_id)
+
+        prev_img = None
+        next_img = None
+
+        # Сосед на 1 выше (ID < mid), самый ближайший
+        if prefer in ("any", "previous"):
+            async for message in client.iter_messages(
+                forum_entity,
+                reply_to=int(topic_id),
+                max_id=mid,        # строго старше
+                limit=1,           # только один — непосредственный сосед сверху
+            ):
+                if message.sender_id == sender_id and _has_image(message):
+                    prev_img = message
+
+        # Сосед на 1 ниже (ID > mid), самый ближайший
+        if prefer in ("any", "next"):
+            async for message in client.iter_messages(
+                forum_entity,
+                reply_to=int(topic_id),
+                min_id=mid,        # строго новее
+                reverse=True,      # от старых к новым → первый = ближайший сверху от mid
+                limit=1,           # только один — непосредственный сосед снизу
+            ):
+                if message.sender_id == sender_id and _has_image(message):
+                    next_img = message
+
+        if prefer == "previous":
+            return prev_img
+        if prefer == "next":
+            return next_img
+        return prev_img or next_img
+
+    except Exception as e:
+        print(f"[Ошибка] get_image_message_from_same_author({message_id}): {e}")
+        return None
+
+def _has_video_or_gif(message) -> bool:
+    """Видео (message.video) либо GIF/анимация (message.gif),
+       либо документ с MIME video/* или image/gif."""
+    if getattr(message, "video", None):
+        return True
+    if getattr(message, "gif", None):
+        return True
+    file = getattr(message, "file", None)
+    if file is not None:
+        mime = getattr(file, "mime_type", None) or ""
+        if mime.startswith("video/") or mime == "image/gif":
+            return True
+    return False
+
+
+async def get_video_message_from_same_author(
+    client: TelegramClient,
+    forum_id: int,
+    topic_id: int,
+    message_id: int,
+    prefer: str = "any",   # "any" | "previous" | "next"
+):
+    """
+    Ищет видео/GIF-сообщение СРЕДИ НЕПОСРЕДСТВЕННЫХ СОСЕДЕЙ сообщения message_id
+    в том же топике, причём от ТОГО ЖЕ автора.
+
+    Проверяются ровно два соседа (не дальше одного сообщения):
+      - сообщение с ID на 1 выше (более старое),
+      - сообщение с ID на 1 ниже (более новое).
+    Возвращается только тот, который одновременно:
+      * от того же sender_id, что и message_id,
+      * содержит видео (message.video) или GIF-анимацию (message.gif,
+        либо документ с MIME video/* / image/gif).
+
+    :param prefer: "any"      — сначала проверяется верхний сосед, затем нижний;
+                   "previous" — смотреть только верхнего соседа;
+                   "next"     — смотреть только нижнего соседа.
+    :return:       объект сообщения Telethon или None.
+    """
+    try:
+        original = await fetch_one_message(client, forum_id, topic_id, message_id)
+        if original is None:
+            return None
+
+        sender_id = original.sender_id
+        if sender_id is None:
+            return None
+
+        forum_entity = await client.get_entity(int(forum_id))
+        mid = int(message_id)
+
+        prev_vid = None
+        next_vid = None
+
+        # Сосед на 1 выше (ID < mid), самый ближайший
+        if prefer in ("any", "previous"):
+            async for message in client.iter_messages(
+                forum_entity,
+                reply_to=int(topic_id),
+                max_id=mid,        # строго старше
+                limit=1,           # только один — непосредственный сосед сверху
+            ):
+                if message.sender_id == sender_id and _has_video_or_gif(message):
+                    prev_vid = message
+
+        # Сосед на 1 ниже (ID > mid), самый ближайший
+        if prefer in ("any", "next"):
+            async for message in client.iter_messages(
+                forum_entity,
+                reply_to=int(topic_id),
+                min_id=mid,        # строго новее
+                reverse=True,      # от старых к новым → первый = ближайший снизу
+                limit=1,           # только один — непосредственный сосед снизу
+            ):
+                if message.sender_id == sender_id and _has_video_or_gif(message):
+                    next_vid = message
+
+        if prefer == "previous":
+            return prev_vid
+        if prefer == "next":
+            return next_vid
+        return prev_vid or next_vid
+
+    except Exception as e:
+        print(f"[Ошибка] get_video_message_from_same_author({message_id}): {e}")
+        return None
+
+
+async def download_audio_by_id(
+    client: TelegramClient,
+    forum_id: int,
+    topic_id: int,
+    message_id: int,
+):
+    """
+    Скачивает аудиофайл из сообщения с заданным ID в каталог config.OUTPUT_DIR.
+    Если файл с таким именем уже существует — перезаписывает его поверх.
+
+    :param client:      активированный TelegramClient
+    :param forum_id:    ID форума (канала)
+    :param topic_id:    ID топика (ветки)
+    :param message_id:  ID сообщения
+    :return:            путь к сохранённому файлу (str) или None, если скачать не удалось
+                        (сообщение не найдено / в нём нет аудио / ошибка скачивания).
+    """
+    if not os.path.exists(config.OUTPUT_DIR):
+        os.makedirs(config.OUTPUT_DIR, exist_ok=True)
+
+    message = await fetch_one_message(client, forum_id, topic_id, message_id)
+    if message is None:
+        print(f"[Пропуск] Сообщение {message_id} не получено.")
+        return None
+
+    if not message.audio:
+        print(f"[Пропуск] В сообщении {message_id} нет аудио.")
+        return None
+
+    # Имя файла: из метаданных, иначе синтетическое (как в download_tracks)
+    filename = getattr(message.file, 'name', None)
+    if not filename:
+        ext = ""
+        mime = getattr(message.file, 'mime_type', None) or ""
+        if "/" in mime:
+            ext = "." + mime.split("/", 1)[1].split(";")[0].strip()
+        filename = f"audio_{message.id}_{message.date.strftime('%Y%m%d_%H%M%S')}{ext}"
+
+    file_path = os.path.join(config.OUTPUT_DIR, filename)
+
+    # Перезапись поверх: если файл уже есть — удаляем заранее,
+    # чтобы Telethon не создал «filename (1).ogg» вместо перезаписи.
+    if os.path.exists(file_path):
+        try:
+            os.remove(file_path)
+            print(f"[Инфо] Старый файл перезаписывается: {file_path}")
+        except Exception as e:
+            print(f"[Ошибка] Не удалось удалить старый файл {file_path}: {e}")
+            return None
+
+    msg_local_time = message.date.astimezone()
+    print(f"Найдено в {msg_local_time.strftime('%H:%M:%S')}. Скачивание аудио: {filename}...")
+
+    try:
+        path = await client.download_media(message, file=file_path)
+        print(f"[Успешно] Сохранено: {path}")
+        return path
+    except Exception as e:
+        print(f"[Ошибка] Не удалось скачать {filename}: {e}")
+        return None
+
 
 async def download_tracks (client, forum_id, topic_id, messages):
     if not os.path.exists(config.OUTPUT_DIR):

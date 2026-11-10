@@ -73,8 +73,8 @@ class TelegramPlayerUI:
         # === НОВОЕ: кнопка Download ===
         self.download_btn = ft.Button(
             "Download",
-            on_click=lambda e: self.on_download_clicked_bridge()
-        )        
+            on_click=lambda e: self.on_download_clicked_bridge(),
+        )
 
         top_row = ft.Row(
             controls=[self.forum_dropdown, self.topic_dropdown],
@@ -244,14 +244,15 @@ class TelegramPlayerUI:
         except Exception as ex:
             print(f"[UI Error] Ошибка парсинга чекбокса: {ex}")
 
+    def on_download_clicked_bridge(self):
+        print("[LOG] Клик по кнопке Download.")
+        self.safe_execute(self.download_audios_and_images())
+
+
     # В секцию "ЧИСТЫЕ МЕТОДЫ БЕЗ СИСТЕМНЫХ АРГУМЕНТОВ"
     def on_audio_changed_bridge(self):
         print(f"[LOG] Фильтр audio изменен на: {self.audio_checkbox.value}")
         self.safe_execute(self.load_messages_from_telegram())
-
-    def on_download_clicked_bridge(self):
-        print("[LOG] Клик по кнопке 'Download'.")
-        self.safe_execute(self.download_tracks())
 
     # =========================================================================
     # АСИНХРОННАЯ БИЗНЕС-ЛОГИКА
@@ -431,103 +432,6 @@ class TelegramPlayerUI:
             self.loader.visible = False
             self.page.update()
 
-            async def download_tracks(self):
-                """
-                Запускает загрузку треков по текущему контексту UI:
-                форум + топик + сообщения из posts_list + текущие фильтры.
-                """
-                print("[UI Async] Запуск download_tracks...")
-
-                if not self.forum_dropdown.value or not self.topic_dropdown.value:
-                    print("[UI Warning] Не выбраны форум или топик — загрузка отменена.")
-                    self.selected_post_text.value = "Download: не выбран форум/топик"
-                    self.page.update()
-                    return
-
-                self.loader.visible = True
-                self.page.update()
-
-                try:
-                    # Собираем данные из текущего ListView
-                    messages = [
-                        control.data
-                        for control in self.posts_list.controls
-                        if isinstance(control, ft.ListTile) and control.data
-                    ]
-                    print(f"[UI Async] Сообщений для загрузки: {len(messages)}")
-
-                    # Вызываем backend, если у него есть соответствующий метод
-                    if hasattr(self.backend, "download_tracks"):
-                        await self.backend.download_tracks(
-                            forum_id   = self.forum_dropdown.value,
-                            topic_id   = self.topic_dropdown.value,
-                            messages   = messages,
-                            reactions  = list(self.selected_reactions),
-                            audio_only = self.audio_checkbox.value,
-                        )
-                    else:
-                        print("[UI Warning] backend.download_tracks не реализован — заглушка.")
-
-                    self.selected_post_text.value = f"Download: {len(messages)} постов"
-                    self.page.update()
-
-                except asyncio.CancelledError:
-                    print("[UI Async] download_tracks отменён.")
-                    raise
-                except Exception as ex:
-                    print(f"[UI Critical Error] Ошибка в download_tracks: {ex}")
-                    traceback.print_exc()
-                finally:
-                    self.loader.visible = False
-                    self.page.update()
-
-    async def download_tracks(self):
-        """
-        Запускает загрузку треков по текущему контексту UI:
-        форум + топик + сообщения из posts_list + текущие фильтры.
-        """
-        print("[UI Async] Запуск download_tracks...")
-
-        if not self.forum_dropdown.value or not self.topic_dropdown.value:
-            print("[UI Warning] Не выбраны форум или топик — загрузка отменена.")
-            self.selected_post_text.value = "Download: не выбран форум/топик"
-            self.page.update()
-            return
-
-        self.loader.visible = True
-        self.page.update()
-
-        try:
-            # Собираем данные из текущего ListView
-            messages = [
-                control.data.get("id", "N/A")
-                for control in self.posts_list.controls
-                if isinstance(control, ft.ListTile) and control.data
-            ]
-            print(f"[UI Async] Сообщений для загрузки: {len(messages)}")
-
-            # Вызываем backend, если у него есть соответствующий метод
-            if hasattr(self.backend, "download_tracks"):
-                await self.backend.download_tracks(
-                    forum_id    = self.forum_dropdown.value,
-                    topic_id    = self.topic_dropdown.value,
-                    messages    = messages
-                )
-            else:
-                print("[UI Warning] backend.download_tracks не реализован — заглушка.")
-
-            self.selected_post_text.value = f"Download: {len(messages)} постов"
-            self.page.update()
-
-        except asyncio.CancelledError:
-            print("[UI Async] download_tracks отменён.")
-            raise
-        except Exception as ex:
-            print(f"[UI Critical Error] Ошибка в download_tracks: {ex}")
-            traceback.print_exc()
-        finally:
-            self.loader.visible = False
-            self.page.update()
 
 
     def update_dropdown_options(self, dropdown_component, file_name):
@@ -659,6 +563,60 @@ class TelegramPlayerUI:
         finally:
             self.loader.visible = False
             self.page.update()
+
+    async def download_audios_and_images(self):
+        """
+        Скачивает аудио и соседние картинки для первых 10 сообщений из posts_list.
+        ID сообщений берутся из атрибута .data каждого ft.ListTile.
+        """
+        if not self.forum_dropdown.value or not self.topic_dropdown.value:
+            self.selected_post_text.value = "Выберите форум и топик"
+            self.page.update()
+            return
+
+        # ---- Собираем до 10 ID из ListTile.data ----
+        message_ids = []
+        for control in self.posts_list.controls:
+            if isinstance(control, ft.ListTile) and control.data:
+                msg_id = control.data.get("id")
+                if msg_id is not None:
+                    message_ids.append(msg_id)
+                if len(message_ids) >= 10:
+                    break
+
+        if not message_ids:
+            self.selected_post_text.value = "Нет постов для скачивания"
+            self.page.update()
+            return
+
+        self.loader.visible = True
+        self.selected_post_text.value = f"Скачивание {len(message_ids)} файлов..."
+        self.page.update()
+
+        try:
+            reports = await self.backend.download_audios_and_images_by_ids(
+                forum_id=self.forum_dropdown.value,
+                topic_id=self.topic_dropdown.value,
+                message_ids=message_ids,
+            )
+            total   = len(reports)
+            audios  = sum(1 for r in reports if r.get("audio_path"))
+            images  = sum(1 for r in reports if r.get("image_path"))
+            self.selected_post_text.value = (
+                f"Готово: аудио {audios}/{total}, картинок {images}/{total}"
+            )
+            print(f"[UI Async] {self.selected_post_text.value}")
+        except asyncio.CancelledError:
+            print("[UI Async] Скачивание отменено пользователем.")
+            raise
+        except Exception as ex:
+            print(f"[UI Critical Error] Ошибка скачивания: {ex}")
+            traceback.print_exc()
+            self.selected_post_text.value = f"Ошибка: {ex}"
+        finally:
+            self.loader.visible = False
+            self.page.update()
+            
 
     def on_post_selected(self, e):
         # Получаем данные выбранного сообщения

@@ -140,6 +140,93 @@ class TelegramBackend:
 
         return (ui_mapped_messages,pinned_list)
 
+    async def get_image_message_from_same_author(
+        self,
+        forum_id: str,
+        topic_id: str,
+        message_id: int,
+        prefer: str = "any",   # "any" | "previous" | "next"
+    ):
+        """
+        Возвращает сообщение с картинкой от того же автора, что и сообщение `message_id`,
+        но только среди ДВУХ непосредственных соседей в топике (1 вверх / 1 вниз).
+
+        :param prefer: "any"      — любой подходящий сосед (сначала верхний);
+                       "previous" — только 1 вверх;
+                       "next"     — только 1 вниз.
+        :return:       dict с данными сообщения для UI, либо None.
+        """
+        if not forum_id or not topic_id or forum_id == "error" or topic_id == "error":
+            print("[Backend] Ошибка: Неверный forum_id или topic_id.")
+            return None
+
+        if not self.client:
+            print("[Backend] Критическая ошибка: TelegramClient не передан в TelegramBackend.")
+            return None
+
+        try:
+            message = await tg_backend.get_image_message_from_same_author(
+                client=self.client,
+                forum_id=forum_id,
+                topic_id=topic_id,
+                message_id=message_id,
+                prefer=prefer,
+            )
+        except Exception as ex:
+            print(f"[Backend] Ошибка при поиске соседнего сообщения с картинкой: {ex}")
+            return None
+
+        if message is None:
+            return None
+
+        # Адаптация под UI — так же, как в fetch_telegram_messages
+        text = getattr(message, "text", "") or ""
+        text_snippet = text.strip()
+
+        file_name = None
+        has_file = False
+        if getattr(message, "media", None) and not getattr(message, "photo", None):
+            has_file = True
+            file_name = getattr(getattr(message, "file", None), "name", None)
+
+        if not text_snippet and has_file:
+            text_snippet = f"Файл: {file_name}"
+        elif not text_snippet:
+            text_snippet = f"Сообщение {message.id}"
+
+        title = text_snippet if len(text_snippet) < 60 else text_snippet[:57] + "..."
+
+        return {
+            "id":         message.id,
+            "date":       message.date.isoformat() if message.date else None,
+            "text":       text,
+            "title":      title,
+            "sender_id":  message.sender_id,
+            "has_file":   has_file,
+            "file_name":  file_name,
+            "has_image":  True,
+            # reaction-полей здесь нет — они не нужны для картинки-соседа,
+            # но структуру можно привести к тому же виду, что и mapped_msg,
+            # если UI ожидает единый формат:
+            "total":      0,
+            "reactions":  [],
+        }
+
+    async def download_audio_by_id(self, forum_id, topic_id, message_id):
+        if not self.client:
+            print("[Backend] Критическая ошибка: TelegramClient не передан в TelegramBackend.")
+            return None
+        try:
+            return await tg_backend.download_audio_by_id(
+                client=self.client,
+                forum_id=forum_id,
+                topic_id=topic_id,
+                message_id=message_id,
+            )
+        except Exception as ex:
+            print(f"[Backend] Ошибка при скачивании аудио {message_id}: {ex}")
+            return None
+
     async def download_tracks (self, forum_id, topic_id, messages):
         res = await tg_backend.download_tracks(
                     client=self.client,
@@ -149,4 +236,19 @@ class TelegramBackend:
                 )
         return res
 
-
+    async def download_audios_and_images_by_ids(self, forum_id, topic_id, message_ids):
+        if not self.client:
+            print("[Backend] Критическая ошибка: TelegramClient не передан в TelegramBackend.")
+            return []
+        try:
+            return await tg_backend.download_audios_and_images_by_ids(
+                client=self.client,
+                forum_id=forum_id,
+                topic_id=topic_id,
+                message_ids=message_ids,
+            )
+        except Exception as ex:
+            print(f"[Backend] Ошибка при пакетной загрузке аудио+картинок: {ex}")
+            traceback.print_exc()   # <-- добавить
+            raise                   # <-- пробросить в UI, либо вернуть []
+            
