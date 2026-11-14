@@ -648,7 +648,7 @@ def fetch_telegram_messages(client, forum_id: str, topic_id: str, pinned_id: str
         messages_list = []
 
         # Вычисляем порог времени на основе переданного фильтра
-        if time_filter == "pin":
+        if time_filter == "pin" or time_filter == "pinned" :
             # Если pinned_id не задан (0/пусто) — берём последнее закреплённое автоматически.
             pid = int(pinned_id) if pinned_id else 0
             if pid <= 0:
