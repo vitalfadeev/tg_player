@@ -34,4 +34,4 @@ Windows 10/11: [tg_player-1.1.zip](https://github.com/vitalfadeev/tg_player/rele
 
 ## Автоматический режим
 
-Пример в `batch-battle.bat`
+Пример в [batch-battle.bat](batch-battle.bat)
