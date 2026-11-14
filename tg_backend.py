@@ -8,8 +8,9 @@ from zoneinfo import ZoneInfo
 from telethon import TelegramClient, connection
 from telethon.tl.types import Channel
 from telethon.tl.functions.messages import GetForumTopicsRequest
-from telethon.tl.types import DocumentAttributeAudio
+from telethon.tl.functions.messages import SearchRequest
 from telethon.tl.types import InputMessagesFilterPinned
+from telethon.tl.types import DocumentAttributeAudio
 MSK = ZoneInfo("Europe/Moscow")
 
 # Импортируем настройки из созданного файла config.py
@@ -367,35 +368,43 @@ async def get_last_pinned_messages(
     client: TelegramClient,
     forum_id: int,
     topic_id: int,
-    limit: int = 5,
+    limit: int = 50,
 ):
     """
     Возвращает до `limit` последних закреплённых сообщений в топике.
-
-    Важно: нельзя передавать `reply_to` вместе с `filter`, иначе Telethon
-    игнорирует фильтр (ограничение Telegram API). Поэтому сначала получаем
-    все закрепы канала через InputMessagesFilterPinned, а затем оставляем
-    только те, что относятся к нужному топику.
     """
     forum_entity = await client.get_entity(int(forum_id))
+    topic_id_int = int(topic_id)
+    limit_int = int(limit)
     result = []
 
-    async for message in client.iter_messages(
-        forum_entity,
-        filter=InputMessagesFilterPinned(),   # серверный фильтр только закрепов
-    ):
-        # Проверяем, что сообщение принадлежит нужному топику
+    resp = await client(SearchRequest(
+        peer=forum_entity,
+        q='',
+        filter=InputMessagesFilterPinned(),
+        min_date=None,
+        max_date=None,
+        offset_id=0,
+        add_offset=0,
+        limit=limit_int,
+        max_id=0,
+        min_id=0,
+        hash=0,
+        top_msg_id=topic_id_int,
+    ))
+
+    for message in resp.messages:
+        # Оставляем дополнительную защиту на случай, если API вернёт лишнее
         reply = getattr(message, "reply_to", None)
         top_id = getattr(reply, "reply_to_top_id", None) if reply else None
 
-        # В форумах у сообщений внутри топика reply_to_top_id == topic_id.
-        # Если top_id is None — это сообщение не в топике (или общий чат).
-        if top_id is not None and int(top_id) == int(topic_id):
+        if top_id is None or int(top_id) == topic_id_int:
             result.append(msg_from_tgmssage(message, []))
-            if len(result) >= limit:
+            if len(result) >= limit_int:
                 break
 
     return result
+
 
 
 async def get_messages_from_last_pin_to_end(client: TelegramClient, forum_id: int, topic_id: int, audio_only: bool, reactions: list):

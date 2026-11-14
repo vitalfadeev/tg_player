@@ -536,7 +536,7 @@ class TelegramPlayerUI:
             self.page.update()
             try:
                 pins = await self.backend.get_last_pinned_messages(
-                    forum_id, topic_id, limit=20
+                    forum_id, topic_id, limit=100
                 )
             except Exception as ex:
                 print(f"[show_pins_popup] backend failed: {ex!r}")
@@ -582,13 +582,14 @@ class TelegramPlayerUI:
                         ],
                         spacing=8,
                     ),
-                    on_click=lambda e, m=mid, d=date_short, t=title:
-                        self.select_pin(m, d, t),
+                    on_click=lambda e, m=mid, d=date_short, t=title, rt=text:
+                        self.select_pin(m, d, t, rt),
                     padding=6,
                     border_radius=4,
                     bgcolor=ft.Colors.SURFACE_CONTAINER_HIGHEST,
                 )
                 data_rows.append(row)
+
 
             dialog = ft.AlertDialog(
                 modal=True,
@@ -646,7 +647,7 @@ class TelegramPlayerUI:
             self.close_pins_popup()
 
 
-    def select_pin(self, pinned_id, date_short, title):
+    def select_pin(self, pinned_id, date_short, title, raw_text: str = ""):
         """
         Пользователь выбрал строку в popup: сохраняем pinned_id, закрываем popup,
         переключаем фильтр на «pin» и перезагружаем сообщения.
@@ -656,6 +657,16 @@ class TelegramPlayerUI:
 
         short_title = title if len(title) <= 40 else title[:37] + "..."
         self.subject_dropdown.content = f"{date_short} {short_title}"
+        
+        if raw_text:
+            self.subject_dropdown.tooltip = ft.Tooltip(
+                message=raw_text,
+                bgcolor=ft.Colors.BLUE_GREY_700,
+                text_style=ft.TextStyle(color=ft.Colors.WHITE),
+            )
+        else:
+            self.subject_dropdown.tooltip = None
+
         try:
             self.subject_dropdown.update()
         except Exception:

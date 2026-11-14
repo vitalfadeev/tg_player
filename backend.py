@@ -78,7 +78,7 @@ class TelegramBackend:
 
         return msg
 
-    async def get_last_pinned_messages(self, forum_id, topic_id, limit: int = 5):
+    async def get_last_pinned_messages(self, forum_id, topic_id, limit: int = 50):
         """
         Возвращает список до `limit` последних закреплённых сообщений топика.
         Используется для popup-списка закрепов в UI.
