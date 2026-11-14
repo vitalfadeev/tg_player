@@ -5,18 +5,13 @@
 парсит поля "автор", "аудио", "длина", "ссылка",
 преобразует tg:// ссылки в https://t.me/...,
 сортирует по имени файла (natural sort)
-и формирует mp4/description.txt с таймкодами (главами) для YouTube.
+и формирует video/description.txt с таймкодами (главами) для YouTube.
 """
 
 import re
 import sys
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
-
-
-SRC_DIR  = Path("mp3")
-OUT_DIR  = Path("mp4")
-OUT_FILE = OUT_DIR / "description.txt"
 
 
 def natural_key(name: str):
@@ -84,7 +79,7 @@ def format_time(seconds: float) -> str:
     total = int(round(seconds))
     h, rem = divmod(total, 3600)
     m, s = divmod(rem, 60)
-    return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+    return f"{h:02d}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
 
 
 def strip_mp3(name: str) -> str:
@@ -92,14 +87,24 @@ def strip_mp3(name: str) -> str:
     return re.sub(r"\s+", " ", name).strip()
 
 
-def main() -> None:
-    if not SRC_DIR.is_dir():
-        sys.exit(f"Каталог '{SRC_DIR}' не найден.")
+def generate_description(src_dir: Path, out_file: Path) -> int:
+    """
+    Собирает description.txt с таймкодами (главами) из txt-сайдкаров.
 
-    OUT_DIR.mkdir(exist_ok=True)
+    :param src_dir:  каталог с mp3 и одноимёнными NN.txt
+    :param out_file: путь к результирующему description.txt
+    :return: 0 при успехе, 1 при ошибке
+    """
+    if not src_dir.is_dir():
+        print(f"Каталог '{src_dir}' не найден.", file=sys.stderr)
+        return 1
 
-    txt_files = sorted(SRC_DIR.glob("*.txt"), key=lambda p: natural_key(p.name))
-    print(f"Найдено txt-файлов в {SRC_DIR}/: {len(txt_files)}")
+    out_file.parent.mkdir(parents=True, exist_ok=True)
+
+    txt_files = sorted(
+        src_dir.glob("*.txt"), key=lambda p: natural_key(p.name)
+    )
+    print(f"Найдено txt-файлов в {src_dir}/: {len(txt_files)}")
 
     entries, skipped = [], []
     for path in txt_files:
@@ -128,9 +133,9 @@ def main() -> None:
         print(f"  пропущен {name}: нет полей {miss}")
 
     if not entries:
-        sys.exit("Не найдено подходящих txt-файлов.")
+        print("Не найдено подходящих txt-файлов.", file=sys.stderr)
+        return 1
 
-    # Порядок уже задан sorted(...) выше.
     lines, current = [], 0.0
     for e in entries:
         lines.append(
@@ -138,11 +143,34 @@ def main() -> None:
         )
         current += e["duration"]
 
-    OUT_FILE.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    out_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
-    print(f"\nГотово: {OUT_FILE}")
+    print(f"\nГотово: {out_file}")
     print(f"Записей: {len(lines)}, общая длительность: {format_time(current)}")
+    return 0
+
+
+def main(argv=None) -> int:
+    import argparse
+    parser = argparse.ArgumentParser(
+        prog="make_description",
+        description="Генерирует description.txt из txt-сайдкаров mp3/.",
+    )
+    parser.add_argument(
+        "--src_dir", default="mp3",
+        help="Каталог с mp3 и txt-сайдкарами (по умолчанию mp3)",
+    )
+    parser.add_argument(
+        "--output", default="video/description.txt",
+        help="Путь к результирующему description.txt "
+             "(по умолчанию mp4/description.txt)",
+    )
+    args, _ = parser.parse_known_args(argv)
+    return generate_description(
+        src_dir=Path(args.src_dir),
+        out_file=Path(args.output),
+    )
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

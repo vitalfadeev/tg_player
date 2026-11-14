@@ -1,8 +1,22 @@
 import os
+import sys
 import flet as ft
 import traceback
 import asyncio
 import subprocess
+from pathlib import Path
+
+import config
+
+def _human_bytes(n: int) -> str:
+    if n is None:
+        return "?"
+    n = float(n)
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024.0:
+            return f"{n:,.1f} {unit}".replace(",", " ")
+        n /= 1024.0
+    return f"{n:,.1f} TB".replace(",", " ")
 
 
 class TelegramPlayerUI:
@@ -12,6 +26,15 @@ class TelegramPlayerUI:
         self.selected_reactions = set()
 
         self.current_fetch_task = None
+        self._pins_dialog = None
+        self._download_dialog = None
+        self.current_download_task = None
+        self._dl_cancelled = False
+        self._dl_generation = 0
+
+        self._dl_last_update_ts = 0.0     # для троттлинга
+        self._dl_bytes_text = None        # создаётся в open_download_dialog        
+        self._dl_close_btn = None
         
         # Защита от Garbage Collector
         self.page.data = self
@@ -55,7 +78,7 @@ class TelegramPlayerUI:
             tooltip=self.pinned_tooltip,
             on_click=lambda e: self.on_subject_selected_bridge()
         )
-        self.subject_dropdown.pinned_id = None
+        self.pinned_id = None
         
         self.selected_post_text = ft.Text("Ничего не выбрано", color=ft.Colors.BLUE_400, weight=ft.FontWeight.BOLD, size=12)
         self.loader = ft.ProgressRing(width=20, height=20, stroke_width=3, visible=False)
@@ -72,7 +95,7 @@ class TelegramPlayerUI:
 
         # === НОВОЕ: кнопка Download ===
         self.download_btn = ft.Button(
-            "Download",
+            "В Youtube",
             on_click=lambda e: self.on_download_clicked_bridge(),
         )
 
@@ -90,8 +113,9 @@ class TelegramPlayerUI:
                     ft.Radio(value="year", label="год"),
                     ft.Radio(value="month", label="месяц"),
                     ft.Radio(value="week", label="неделя"),
+                    ft.Radio(value="yesterday", label="вчера"),
                     ft.Radio(value="day", label="день"),
-                    ft.Radio(value="pinned", label="закреп"),
+                    ft.Radio(value="pin", label="закреп"),
                 ],
                 alignment=ft.MainAxisAlignment.START,
                 spacing=15
@@ -111,15 +135,17 @@ class TelegramPlayerUI:
         )
 
         reaction_controls = []
+        reaction_1 = False
         for emoji_text in self.EMOJI_ICONS:  # Итерируемся по ключам-эмодзи
             # Текстовая подпись с эмодзи прямо в чекбоксе
             cb = ft.Checkbox(
                 label=emoji_text,
-                value=False,
+                value=reaction_1,
                 data=emoji_text,
                 label_style=ft.TextStyle(size=18),  # крупнее, чтобы эмодзи читалось
             )
             reaction_controls.append(cb)
+            reaction_1 = False
 
         # Инициализируем чекбокс audio с отступом слева для визуального разделения
         self.audio_checkbox = ft.Checkbox(
@@ -140,9 +166,10 @@ class TelegramPlayerUI:
             controls=[
                 ft.Text("", weight=ft.FontWeight.BOLD, size=13), 
                 *reaction_controls,
-                self.audio_checkbox,        # <-- Новый чекбокс встанет сразу за реакциями
-                ft.Container(expand=True),  # «Пружина», выталкивающая кнопку в самый край
-                self.to_text_btn
+                self.audio_checkbox,
+                ft.Container(expand=True),  # «Пружина», выталкивает кнопки вправо
+                self.to_text_btn,
+                self.download_btn,          # <-- теперь после «В текст»
             ],
             alignment=ft.MainAxisAlignment.START, 
             vertical_alignment=ft.CrossAxisAlignment.CENTER, 
@@ -166,11 +193,6 @@ class TelegramPlayerUI:
                 alignment=ft.MainAxisAlignment.SPACE_BETWEEN
             ),
             self.posts_list,
-            # === НОВОЕ: строка под ListView с кнопкой справа ===
-            ft.Row(
-                controls=[self.download_btn],
-                alignment=ft.MainAxisAlignment.END,
-            ),
         )
 
         # 3. ИСПРАВЛЕНО ДЛЯ PYTHON 3.13 & FLET 1.0.5: стабильные лямбда-обертки
@@ -214,13 +236,8 @@ class TelegramPlayerUI:
         self.safe_execute(self.on_forum_selected_async())
 
     def on_subject_selected_bridge(self):
-        print("[LOG] Нажата кнопка диапазона закрепа.")
-        # Принудительно переключаем радио-фильтр в режим "pinned"
-        if self.filter_radio_group.value != "pinned":
-            self.filter_radio_group.value = "pinned"
-            self.filter_radio_group.update()
-                
-        self.safe_execute(self.load_messages_from_telegram())
+        print("[LOG] Нажата кнопка выбора закрепа — открываем popup с 5 последними.")
+        self.safe_execute(self.show_pins_popup())
 
     def on_filter_changed_bridge(self):
         print(f"[LOG] Радио-фильтр изменен мышкой на: {self.filter_radio_group.value}")
@@ -246,8 +263,7 @@ class TelegramPlayerUI:
 
     def on_download_clicked_bridge(self):
         print("[LOG] Клик по кнопке Download.")
-        self.safe_execute(self.download_audios_and_images())
-
+        self.open_download_dialog()
 
     # В секцию "ЧИСТЫЕ МЕТОДЫ БЕЗ СИСТЕМНЫХ АРГУМЕНТОВ"
     def on_audio_changed_bridge(self):
@@ -390,10 +406,11 @@ class TelegramPlayerUI:
             ]
             self.topic_dropdown.options = new_options
             
-            
+
             if new_options:
                 self.topic_dropdown.value = new_options[0].key
-                await self.load_pinned_message ()
+                # Поиск закрепа временно отключён — не запускаем при старте.
+                # await self.load_pinned_message()
             else:
                 self.topic_dropdown.value = None
                 
@@ -422,7 +439,7 @@ class TelegramPlayerUI:
         self.loader.visible = True
         self.page.update()
         try:
-            await self.load_pinned_message ()
+            # await self.load_pinned_message ()
             # Затем обновляем основную ленту сообщений
             await self.load_messages_from_telegram()
         except Exception as ex:
@@ -474,6 +491,10 @@ class TelegramPlayerUI:
             self.page.update()
 
     async def load_pinned_message(self):
+        # ВРЕМЕННО ОТКЛЮЧЕНО: поиск закрепа не запускается вообще.
+        # Чтобы вернуть — удалите `return` и раскомментируйте вызовы
+        # в on_forum_selected_async и on_topic_selected_async.
+        return
         message = await self.backend.get_pinned_message(
             forum_id=self.forum_dropdown.value,
             topic_id=self.topic_dropdown.value
@@ -492,11 +513,686 @@ class TelegramPlayerUI:
             )
             self.subject_dropdown.update()
 
-            self.subject_dropdown.pinned_id = message.get("id",None)
+            self.pinned_id = message.get("id",None)
         else:
             self.subject_dropdown.content = ""
             self.subject_dropdown.tooltip.message = ""
-            self.subject_dropdown.pinned_id = None
+            self.pinned_id = None
+
+
+    async def show_pins_popup(self):
+        try:
+            print("[show_pins_popup] START")
+            forum_id = self.forum_dropdown.value
+            topic_id = self.topic_dropdown.value
+            print(f"[show_pins_popup] forum_id={forum_id!r} topic_id={topic_id!r}")
+
+            if not forum_id or not topic_id:
+                self.selected_post_text.value = "Выберите форум и топик"
+                self.page.update()
+                return
+
+            self.loader.visible = True
+            self.page.update()
+            try:
+                pins = await self.backend.get_last_pinned_messages(
+                    forum_id, topic_id, limit=20
+                )
+            except Exception as ex:
+                print(f"[show_pins_popup] backend failed: {ex!r}")
+                import traceback
+                traceback.print_exc()
+                pins = []
+            finally:
+                self.loader.visible = False
+                self.page.update()
+
+            print(f"[show_pins_popup] pins count = {len(pins)}")
+            if not pins:
+                self.selected_post_text.value = "Закрепов не найдено"
+                self.page.update()
+                return
+
+            header = ft.Row(
+                controls=[
+                    ft.Text("id",    width=80,    weight=ft.FontWeight.BOLD),
+                    ft.Text("date",  width=110,   weight=ft.FontWeight.BOLD),
+                    ft.Text("title", expand=True, weight=ft.FontWeight.BOLD),
+                ],
+                spacing=8,
+            )
+
+            data_rows: list[ft.Control] = []
+            for pin in pins:
+                mid        = pin.get("id", "")
+                date_short = (pin.get("date") or "")[:10]
+                text       = pin.get("raw_text") or ""
+                first_line = text.splitlines()[0] if text else ""
+                if not first_line:
+                    first_line = f"Сообщение {mid}"
+                title = first_line[:200]
+
+                row = ft.Container(
+                    content=ft.Row(
+                        controls=[
+                            ft.Text(str(mid), width=80),
+                            ft.Text(date_short, width=110),
+                            ft.Text(title, expand=True, max_lines=1,
+                                    overflow=ft.TextOverflow.ELLIPSIS),
+                        ],
+                        spacing=8,
+                    ),
+                    on_click=lambda e, m=mid, d=date_short, t=title:
+                        self.select_pin(m, d, t),
+                    padding=6,
+                    border_radius=4,
+                    bgcolor=ft.Colors.SURFACE_CONTAINER_HIGHEST,
+                )
+                data_rows.append(row)
+
+            dialog = ft.AlertDialog(
+                modal=True,
+                title=ft.Text(f"Последние закрепы ({len(pins)})"),
+                content=ft.Container(
+                    content=ft.Column(
+                        controls=[header] + data_rows,
+                        spacing=4,
+                        tight=True,
+                        scroll=ft.ScrollMode.AUTO,
+                    ),
+                    width=760,
+                    height=320,
+                ),
+                actions=[
+                    ft.TextButton("Закрыть",
+                                  on_click=lambda e: self.close_pins_popup()),
+                ],
+            )
+
+            self._pins_dialog = dialog
+            # Flet 1.0.5: показываем диалог через page.show_dialog()
+            self.page.show_dialog(dialog)
+            print("[show_pins_popup] dialog shown via page.show_dialog()")
+
+            try:
+                self.page.on_keyboard_event = self._on_page_keyboard
+            except Exception as e:
+                print(f"[show_pins_popup] on_keyboard_event attach failed: {e}")
+            print("[show_pins_popup] dialog opened")
+
+        except Exception as e:
+            print(f"[show_pins_popup] CRASH: {e!r}")
+            import traceback
+            traceback.print_exc()
+
+    def close_pins_popup(self):
+        if self._pins_dialog is None:
+            return
+        # Flet 1.0.5: закрываем верхний диалог через page.pop_dialog()
+        try:
+            self.page.pop_dialog()
+        except Exception as e:
+            print(f"[close_pins_popup] pop_dialog failed: {e!r}")
+        self._pins_dialog = None
+        try:
+            self.page.on_keyboard_event = None
+            self.page.update()
+        except Exception:
+            pass
+
+    def _on_page_keyboard(self, e: ft.KeyboardEvent):
+        if e.key == "Escape" and self._pins_dialog is not None:
+            print("[LOG] Escape: закрываем popup закрепов.")
+            self.close_pins_popup()
+
+
+    def select_pin(self, pinned_id, date_short, title):
+        """
+        Пользователь выбрал строку в popup: сохраняем pinned_id, закрываем popup,
+        переключаем фильтр на «pin» и перезагружаем сообщения.
+        """
+        print(f"[LOG] Выбран закреп: id={pinned_id}")
+        self.pinned_id = pinned_id
+
+        short_title = title if len(title) <= 40 else title[:37] + "..."
+        self.subject_dropdown.content = f"{date_short} {short_title}"
+        try:
+            self.subject_dropdown.update()
+        except Exception:
+            pass
+
+        # Переключаем фильтр на "pin" и грузим сообщения диапазона этого закрепа
+        self.filter_radio_group.value = "pin"
+        try:
+            self.filter_radio_group.update()
+        except Exception:
+            pass
+
+        self.close_pins_popup()
+        self.safe_execute(self.load_messages_from_telegram())
+
+
+    def _on_pins_dialog_key(self, e: ft.KeyboardEvent):
+        if e.key == "Escape" and self._pins_dialog is not None:
+            print("[LOG] Escape: закрываем popup закрепов.")
+            self.close_pins_popup()
+
+
+    # =========================================================================
+    # Диалог скачивания
+    # =========================================================================
+    def open_download_dialog(self):
+        if self._download_dialog is not None:
+            print("[Download] Диалог уже открыт.")
+            return
+        if not self.forum_dropdown.value or not self.topic_dropdown.value:
+            self.selected_post_text.value = "Выберите форум и топик"
+            self.page.update()
+            return
+
+        available = sum(
+            1 for c in self.posts_list.controls
+            if isinstance(c, ft.ListTile) and c.data and c.data.get("id") is not None
+        )
+        if available == 0:
+            self.selected_post_text.value = "Нет постов для скачивания"
+            self.page.update()
+            return
+
+        # ---- Радио-выбор количества треков ----
+        self._dl_radio = ft.RadioGroup(
+            content=ft.Row(
+                controls=[
+                    ft.Radio(value="1",  label="1"),
+                    ft.Radio(value="5",  label="5"),
+                    ft.Radio(value="7",  label="7"),
+                    ft.Radio(value="10", label="10"),
+                    ft.Radio(value="20", label="20"),
+                    ft.Radio(value="30", label="30"),
+                ],
+                spacing=8,
+            ),
+            value="10",
+        )
+        self._dl_radio.on_change = lambda e: self.on_download_radio_changed()
+
+        # ---- Папки: mp3 (OUTPUT_DIR) и video (для результата make_video) ----
+        try:
+            out_dir = os.path.abspath(config.OUTPUT_DIR)
+        except Exception:
+            out_dir = str(config.OUTPUT_DIR)
+
+        # Куда будет сохранён output.mp4: по умолчанию <OUTPUT_DIR>/video,
+        # либо родитель config.MAKE_VIDEO_OUTPUT, если задан.
+        try:
+            if getattr(config, "MAKE_VIDEO_OUTPUT", None):
+                video_dir_abs = os.path.abspath(
+                    os.path.dirname(str(config.MAKE_VIDEO_OUTPUT))
+                )
+            else:
+                video_dir_abs = os.path.abspath(os.path.join(out_dir, "video"))
+        except Exception:
+            video_dir_abs = os.path.join(out_dir, "video")
+
+        self._dl_path_link = ft.Container(
+            content=ft.Text(out_dir, size=12, color=ft.Colors.BLUE_400, italic=True),
+            on_click=lambda e: self._open_folder(out_dir),
+            tooltip="Открыть папку в файловом менеджере",
+            padding=0,
+            ink=True,
+        )
+
+        self._dl_video_path_link = ft.Container(
+            content=ft.Text(video_dir_abs, size=11, color=ft.Colors.BLUE_400, italic=True),
+            on_click=lambda e: self._open_folder(video_dir_abs),
+            tooltip="Открыть папку с результатом (video.mp4)",
+            padding=0,
+            ink=True,
+        )
+
+        # ---- Виджеты скачивания ----
+        self._dl_current_file_text = ft.Text("", size=12, italic=True)
+        self._dl_bytes_bar        = ft.ProgressBar(value=0)
+        self._dl_bytes_text       = ft.Text("", size=11, color=ft.Colors.GREY_700)
+        self._dl_progress         = ft.ProgressBar(value=0)
+        self._dl_progress_text    = ft.Text("0/0", size=12)
+
+        # ---- Виджеты сборки видео ----
+        self._dl_video_progress     = ft.ProgressBar(value=0)
+        self._dl_video_segment_text = ft.Text("Сегмент: 0 / 0", size=11,
+                                              color=ft.Colors.GREY_700)
+
+        self._dl_close_btn = ft.TextButton(
+            "Отмена",
+            on_click=lambda e: self.close_download_dialog(),
+        )
+        
+        # ---- Собираем диалог ----
+        dialog = ft.AlertDialog(
+            modal=True,
+            title=ft.Text("Скачивание"),
+            content=ft.Container(
+                content=ft.Column(
+                    controls=[
+                        ft.Row(
+                            controls=[
+                                ft.Text("Треков:", weight=ft.FontWeight.BOLD),
+                                self._dl_radio,
+                            ],
+                            spacing=10,
+                            alignment=ft.MainAxisAlignment.START,
+                        ),
+                        ft.Column(
+                            controls=[
+                                ft.Text("Папка:", weight=ft.FontWeight.BOLD, size=12),
+                                self._dl_path_link,
+                            ],
+                            spacing=2,
+                            tight=True,
+                        ),
+                        self._dl_current_file_text,
+                        self._dl_bytes_bar,
+                        self._dl_bytes_text,
+                        self._dl_progress,
+                        self._dl_progress_text,
+                        ft.Divider(height=1, thickness=1,
+                                   color=ft.Colors.SURFACE_CONTAINER_HIGHEST),
+                        ft.Text("Сборка видео:", weight=ft.FontWeight.BOLD, size=12),
+                        self._dl_video_progress,
+                        self._dl_video_segment_text,
+                        self._dl_video_path_link,
+                    ],
+                    tight=True,
+                    spacing=10,
+                ),
+                width=560,
+            ),
+            actions=[
+                self._dl_close_btn,
+            ],
+        )
+
+        # ---- Показываем и стартуем скачивание ----
+        self._download_dialog = dialog
+        self._dl_cancelled = False
+        self._dl_generation += 1
+        my_gen = self._dl_generation
+
+        self.page.show_dialog(dialog)
+
+        # Начальные значения — уже после создания всех виджетов
+        self._dl_current_file_text.value = ""
+        self._dl_bytes_bar.value = 0
+        self._dl_bytes_text.value = ""
+        self._dl_progress.value = 0
+        self._dl_progress_text.value = "0/0"
+        self._dl_video_progress.value = 0
+        self._dl_video_segment_text.value = "Сегмент: 0 / 0"
+        self.page.update()
+
+        try:
+            n = int(self._dl_radio.value)
+        except (TypeError, ValueError):
+            n = 10
+            self._dl_radio.value = "10"
+
+        print(f"[Download] Старт сразу после открытия: N={n}, поколение {my_gen}.")
+        self.current_download_task = asyncio.run_coroutine_threadsafe(
+            self.run_download_async(my_gen, n), self.main_loop
+        )
+
+
+    def on_download_radio_changed(self):
+        if self._download_dialog is None:
+            return
+        try:
+            n = int(self._dl_radio.value)
+        except (TypeError, ValueError):
+            n = 10
+
+        print(f"[Download] Смена N на {n}, перезапуск (поколение {self._dl_generation + 1}).")
+        self._dl_generation += 1
+        my_gen = self._dl_generation
+
+        self._dl_progress.value = 0
+        self._dl_progress_text.value = "0/0"
+        self._dl_current_file_text.value = ""
+        self._dl_bytes_bar.value = 0
+        self._dl_bytes_text.value = ""
+        self._dl_video_progress.value = 0
+        self._dl_video_segment_text.value = "Сегмент: 0 / 0"
+        self.page.update()
+
+        self.current_download_task = asyncio.run_coroutine_threadsafe(
+            self.run_download_async(my_gen, n), self.main_loop
+        )
+
+    async def run_download_async(self, my_gen: int, n: int):
+        try:
+            forum_id = self.forum_dropdown.value
+            topic_id = self.topic_dropdown.value
+            if not forum_id or not topic_id:
+                if self._dl_generation == my_gen:
+                    self._dl_progress_text.value = "Выберите форум и топик"
+                    self.page.update()
+                return
+
+            # n уже пришёл из open_download_dialog / on_download_radio_changed —
+            # это ровно то, что выбрано в _dl_radio на момент запуска.
+            if n <= 0:
+                if self._dl_generation == my_gen:
+                    self._dl_progress_text.value = "N должно быть > 0"
+                    self.page.update()
+                return
+
+            ids = []
+            for control in self.posts_list.controls:
+                if isinstance(control, ft.ListTile) and control.data:
+                    mid = control.data.get("id")
+                    if mid is not None:
+                        ids.append(mid)
+                    if len(ids) >= n:
+                        break
+
+            if not ids:
+                if self._dl_generation == my_gen:
+                    self._dl_progress_text.value = "Нет постов для скачивания"
+                    self.page.update()
+                return
+
+            total = len(ids)
+            print(f"[Download] Старт: {total} треков (поколение {my_gen}).")
+
+
+            def on_bytes(filename, received, total):
+                # троттлинг: не чаще ~5 раз в секунду
+                now = asyncio.get_event_loop().time()
+                if now - self._dl_last_update_ts < 0.2:
+                    return
+                self._dl_last_update_ts = now
+
+                if self._dl_generation != my_gen:
+                    return
+                try:
+                    if total and total > 0:
+                        pct = received * 100 // total
+                        self._dl_bytes_bar.value = received / total
+                        self._dl_bytes_text.value = (
+                            f"{_human_bytes(received)} / {_human_bytes(total)}  ({pct}%)"
+                        )
+                    else:
+                        self._dl_bytes_bar.value = 0
+                        self._dl_bytes_text.value = f"{_human_bytes(received)}"
+                    self.page.update()
+                except Exception as e:
+                    print(f"[Download] on_bytes error: {e}")
+
+
+            def on_current_file(idx, tot, filename):
+                if self._dl_generation != my_gen:
+                    return
+                try:
+                    self._dl_current_file_text.value = (
+                        f"Скачивание аудио: {filename}…"
+                    )
+                    self._dl_bytes_bar.value = 0
+                    self._dl_bytes_text.value = ""
+                    self.page.update()
+                except Exception as e:
+                    print(f"[Download] on_current_file error: {e}")
+
+            def on_progress(idx, tot):
+                if self._dl_generation != my_gen:
+                    return
+                try:
+                    self._dl_progress.value = (idx / tot) if tot else 0
+                    self._dl_progress_text.value = f"{idx}/{tot}"
+                    self.page.update()
+                except Exception as e:
+                    print(f"[Download] on_progress error: {e}")
+
+            def should_cancel():
+                return self._dl_cancelled or self._dl_generation != my_gen
+
+            reports = await self.backend.download_audios_and_images_by_ids(
+                forum_id=forum_id,
+                topic_id=topic_id,
+                message_ids=ids,
+                on_progress=on_progress,
+                should_cancel=should_cancel,
+                on_current_file=on_current_file,
+                on_bytes=on_bytes,
+            )            
+
+            if self._dl_generation != my_gen:
+                print(f"[Download] Поколение {my_gen} устарело — результат отброшен.")
+                return
+
+            if self._dl_cancelled:
+                self._dl_progress_text.value = f"Отменено ({len(reports)}/{total})"
+                self.page.update()
+            else:
+                self._dl_progress_text.value = f"Готово ({len(reports)}/{total})"
+                self._dl_current_file_text.value = ""
+                self._dl_bytes_bar.value = 0
+                self._dl_bytes_text.value = ""
+                self.page.update()
+
+                # После завершения скачивания — генерируем description.txt
+                # ровно так же, как это делает main.py.
+                await self._generate_description_async(my_gen)
+
+                # Затем собираем видео из mp3, как в main.py (--make_video).
+                await self._generate_video_async(my_gen)
+
+        except asyncio.CancelledError:
+            print(f"[Download] Задача поколения {my_gen} отменена.")
+            raise
+        except Exception as ex:
+            print(f"[Download] Ошибка: {ex}")
+            traceback.print_exc()
+            if self._dl_generation == my_gen:
+                self._dl_progress_text.value = f"Ошибка: {ex}"
+                self.page.update()
+
+    async def _generate_description_async(self, my_gen: int):
+        """
+        Генерирует description.txt после успешного завершения скачивания.
+        Путь и параметры совпадают с тем, что делает main.py:
+            src_dir   = Path(config.OUTPUT_DIR)
+            desc_file = src_dir / "video" / "description.txt"
+
+        Запускается в отдельном потоке (asyncio.to_thread), чтобы не
+        блокировать event loop UI, если внутри много ffprobe/IO.
+        """
+        try:
+            import make_description
+        except Exception as e:
+            print(f"[Download] make_description недоступен: {e}")
+            return
+
+        src_dir = Path(config.OUTPUT_DIR)
+        desc_dir = src_dir / "video"
+        desc_file = desc_dir / "description.txt"
+
+        print(f"[Download] Генерация описания: {desc_file}")
+        try:
+            rc = await asyncio.to_thread(
+                make_description.generate_description,
+                src_dir=src_dir,
+                out_file=desc_file,
+            )
+        except Exception as e:
+            print(f"[Download] Ошибка генерации описания: {e}")
+            traceback.print_exc()
+            return
+
+        # Если пока шло описание, пользователь уже открыл новый диалог/перезапустил —
+        # просто не трогаем UI, но файл на диске уже лежит.
+        if self._dl_generation != my_gen:
+            print(f"[Download] Поколение {my_gen} устарело, "
+                  f"описание всё равно записано: {desc_file}")
+            return
+
+        if rc != 0:
+            print(f"[Download] ⚠️  Описание не сгенерировано (код {rc}).")
+            try:
+                self._dl_progress_text.value = (
+                    f"Готово ({len(src_dir.iterdir()) if src_dir.exists() else 0} файлов), "
+                    f"описание не создано (код {rc})"
+                )
+                self.page.update()
+            except Exception:
+                pass
+        else:
+            print(f"[Download] Описание готово: {desc_file}")
+
+
+    async def _generate_video_async(self, my_gen: int):
+        """
+        Собирает mp4 из скачанных mp3 — по аналогии с --make_video в main.py.
+
+        Пути по умолчанию:
+            output        = <OUTPUT_DIR>/video/output.mp4
+            default_video = <cwd>/default.mp4  (или config.DEFAULT_VIDEO, если задан)
+            mp3_dir       = <OUTPUT_DIR>
+
+        Любой из них можно переопределить через config:
+            config.MAKE_VIDEO_OUTPUT  — путь к итоговому mp4
+            config.DEFAULT_VIDEO      — путь к видео-заглушке
+
+        Запускается в отдельном потоке, чтобы не блокировать UI на ffmpeg.
+        """
+        try:
+            import make_video
+        except Exception as e:
+            print(f"[Download] make_video недоступен: {e}")
+            return
+
+        src_dir = Path(config.OUTPUT_DIR)
+        out_dir = src_dir / "video"
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        # Аналоги дефолтов main.py, но с возможностью переопределить через config.
+        output = Path(getattr(config, "MAKE_VIDEO_OUTPUT", out_dir / "output.mp4"))
+        default_video = Path(getattr(config, "DEFAULT_VIDEO", "default.mp4"))
+
+        print(f"[Download] Генерация видео: {output}")
+        print(f"[Download]   mp3_dir={src_dir}, default_video={default_video}")
+
+        # Сдвигаем прогресс на 1%, чтобы визуально было заметно, что сборка началась
+        # (до первого колбэка on_segment может пройти заметное время — ffmpeg на первом сегменте).
+        if self._dl_generation == my_gen:
+            try:
+                self._dl_video_progress.value = 0.01
+                self._dl_video_segment_text.value = "Сборка видео запущена…"
+                self.page.update()
+            except Exception as e:
+                print(f"[Download] video start-indicator error: {e}")
+
+
+        def on_segment_worker(idx, total):
+            # Этот колбэк дёргается из worker-потока (to_thread),
+            # поэтому обновляем UI в главном loop через call_soon_threadsafe.
+            if self._dl_generation != my_gen:
+                return
+
+            def _apply():
+                if self._dl_generation != my_gen:
+                    return
+                try:
+                    self._dl_video_progress.value = (idx / total) if total else 0
+                    self._dl_video_segment_text.value = f"Сегмент: {idx} / {total}"
+                    self.page.update()
+                except Exception as e:
+                    print(f"[Download] video progress UI error: {e}")
+
+            try:
+                self.main_loop.call_soon_threadsafe(_apply)
+            except Exception as e:
+                print(f"[Download] call_soon_threadsafe failed: {e}")
+
+        try:
+            rc = await asyncio.to_thread(
+                make_video.run_conversion,
+                output=output,
+                default_video=default_video,
+                mp3_dir=src_dir,
+                on_segment=on_segment_worker,
+            )
+        except Exception as e:
+            print(f"[Download] Ошибка генерации видео: {e}")
+            traceback.print_exc()
+            return
+
+        # Если пользователь уже открыл новый диалог/перезапустил — не трогаем UI,
+        # но файл на диске уже готов.
+        if self._dl_generation != my_gen:
+            print(f"[Download] Поколение {my_gen} устарело, "
+                  f"видео всё равно записано: {output}")
+            return
+
+        if rc != 0:
+            print(f"[Download] ⚠️  Видео не сгенерировано (код {rc}).")
+            try:
+                self._dl_video_segment_text.value = (
+                    f"Видео не создано (код {rc})"
+                )
+                self.page.update()
+            except Exception:
+                pass
+        else:
+            print(f"[Download] Видео готово: {output}")
+            try:
+                self._dl_video_progress.value = 1
+                self._dl_video_segment_text.value = (
+                    f"Готово, видео: {output.name}"
+                )
+                if self._dl_close_btn is not None:
+                    self._dl_close_btn.content = "Закрыть"
+                self.page.update()
+            except Exception:
+                pass
+
+
+    def _open_folder(self, path: str):
+        """Открывает папку в системном файловом менеджере."""
+        try:
+            if path:
+                # если папки ещё нет — создаём, чтобы файловый менеджер не падал
+                os.makedirs(path, exist_ok=True)
+
+            if os.name == 'nt':
+                os.startfile(path)
+            elif sys.platform == 'darwin':
+                subprocess.Popen(["open", path])
+            else:
+                subprocess.Popen(["xdg-open", path])
+            print(f"[Download] Открываю папку: {path}")
+        except Exception as e:
+            print(f"[Download] Не удалось открыть папку {path}: {e}")
+
+
+    def close_download_dialog(self):
+        print("[Download] Закрыть: отмена и закрытие диалога.")
+        # Просим цикл остановиться и «обесцениваем» текущее поколение,
+        # чтобы никакие поздние колбэки не писали в уже закрытый UI.
+        self._dl_cancelled = True
+        self._dl_generation += 1
+
+        if self._download_dialog is not None:
+            try:
+                self.page.pop_dialog()
+            except Exception as e:
+                print(f"[Download] pop_dialog failed: {e!r}")
+            self._download_dialog = None
+
+        self.current_download_task = None
+        try:
+            self.page.update()
+        except Exception:
+            pass
+
 
     async def load_messages_from_telegram(self):
         if not self.forum_dropdown.value or not self.topic_dropdown.value:
@@ -508,15 +1204,18 @@ class TelegramPlayerUI:
         self.page.update()
         try:
             start_pinned_id = None
+            # UI использует короткое "pin"; tg_backend исторически ждёт "pinned".
+            # Маппим здесь, чтобы не менять контракт tg_backend.
+
             messages,pinned_list = await self.backend.fetch_telegram_messages(
                 forum_id        = self.forum_dropdown.value,
                 topic_id        = self.topic_dropdown.value,
-                pinned_id       = self.subject_dropdown.pinned_id,
-                start_pinned_id = self.subject_dropdown.pinned_id,
+                pinned_id       = self.pinned_id,
+                start_pinned_id = self.pinned_id,
                 time_filter     = self.filter_radio_group.value,
                 reactions       = list(self.selected_reactions),
                 audio_only      = self.audio_checkbox.value
-            )
+            )            
             
             # messages list
             self.posts_list.controls.clear()

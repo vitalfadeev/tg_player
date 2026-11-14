@@ -7,6 +7,10 @@ messages.txt
 build
 mp3/
 mp4/
+mp3-battle/
+mp3-test/ 
 backup/
-dist/
-main.spec
+dist/      
+venv/
+venv
+main.spec   

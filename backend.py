@@ -78,6 +78,27 @@ class TelegramBackend:
 
         return msg
 
+    async def get_last_pinned_messages(self, forum_id, topic_id, limit: int = 5):
+        """
+        Возвращает список до `limit` последних закреплённых сообщений топика.
+        Используется для popup-списка закрепов в UI.
+        """
+        if not self.client:
+            print("[Backend] Критическая ошибка: TelegramClient не передан в TelegramBackend.")
+            return []
+        try:
+            return await tg_backend.get_last_pinned_messages(
+                client=self.client,
+                forum_id=forum_id,
+                topic_id=topic_id,
+                limit=limit,
+            )
+        except Exception as ex:
+            print(f"[Backend] Ошибка получения последних закрепов: {ex}")
+            import traceback
+            traceback.print_exc()
+            return []
+            
     async def fetch_telegram_messages(self, forum_id: str, topic_id: str, pinned_id: str, start_pinned_id: str, time_filter: str, reactions: list, audio_only: bool) -> list:
         """
         Запускает актуальный сбор сообщений через TelegramClient из tg_backend.py,
@@ -236,7 +257,11 @@ class TelegramBackend:
                 )
         return res
 
-    async def download_audios_and_images_by_ids(self, forum_id, topic_id, message_ids):
+    async def download_audios_and_images_by_ids(
+        self, forum_id, topic_id, message_ids,
+        on_progress=None, should_cancel=None,
+        on_current_file=None, on_bytes=None,
+    ):
         if not self.client:
             print("[Backend] Критическая ошибка: TelegramClient не передан в TelegramBackend.")
             return []
@@ -246,9 +271,12 @@ class TelegramBackend:
                 forum_id=forum_id,
                 topic_id=topic_id,
                 message_ids=message_ids,
+                on_progress=on_progress,
+                should_cancel=should_cancel,
+                on_current_file=on_current_file,
+                on_bytes=on_bytes,
             )
         except Exception as ex:
             print(f"[Backend] Ошибка при пакетной загрузке аудио+картинок: {ex}")
-            traceback.print_exc()   # <-- добавить
-            raise                   # <-- пробросить в UI, либо вернуть []
-            
+            traceback.print_exc()
+            raise

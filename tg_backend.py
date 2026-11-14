@@ -6,9 +6,9 @@ import datetime
 from datetime import time
 from zoneinfo import ZoneInfo
 from telethon import TelegramClient, connection
-from telethon.tl.types import Channel, PeerUser, PeerChannel, PeerChat
+from telethon.tl.types import Channel
 from telethon.tl.functions.messages import GetForumTopicsRequest
-from telethon.tl.types import InputMessagesFilterMusic
+from telethon.tl.types import DocumentAttributeAudio
 from telethon.tl.types import InputMessagesFilterPinned
 MSK = ZoneInfo("Europe/Moscow")
 
@@ -119,70 +119,56 @@ def _fmt_duration(sec) -> str:
     return f"{m:02d}:{s:02d} ({sec:.3f} сек)"
 
 
-def _read_audio_meta(path) -> tuple[float | None, list[str]]:
+def _get_message_audio_duration(message) -> float | None:
     """
-    Читает длительность и WXXX-ссылки из аудиофайла.
+    Возвращает длительность аудио в секундах, взятую из самого сообщения Telegram.
 
-    WXXX — «user defined URL link frame» в ID3v2 (обычно mp3); для не-ID3
-    форматов (ogg/m4a/flac с vorbis-комментариями) список пустой.
+    Порядок:
+      1) message.file.duration
+      2) message.audio.duration (DocumentAttributeAudio)
+      3) attributes документа: DocumentAttributeAudio.duration
 
-    Порядок определения длительности:
-      1) mutagen.File(...).info.length (любой формат: mp3/ogg/m4a/flac/...);
-      2) если mutagen недоступен/не смог — ffprobe format.duration.
-
-    :return: (duration_sec: float|None, wxxx_list: list[str])
+    :return: float > 0 или None, если длительность недоступна.
     """
-    duration = None
-    wxxx_links: list[str] = []
-
-    # --- 1. mutagen: длительность + WXXX ---
-    try:
-        from mutagen import File as MutagenFile
-        from mutagen.id3 import ID3
-        audio = MutagenFile(path)
-        if audio is not None:
-            info = getattr(audio, "info", None)
-            if info is not None:
-                length = getattr(info, "length", None)
-                if (isinstance(length, (int, float))
-                        and length > 0
-                        and length == length            # отсекаем NaN
-                        and length != float("inf")):    # и inf
-                    duration = float(length)
-            tags = getattr(audio, "tags", None)
-            if isinstance(tags, ID3):
-                for frame in tags.getall("WXXX"):
-                    url = getattr(frame, "url", None)
-                    desc = getattr(frame, "desc", "") or ""
-                    if url:
-                        wxxx_links.append(f"{desc}: {url}" if desc else str(url))
-    except ImportError:
-        pass   # mutagen не установлен — пойдём через ffprobe
-    except Exception as e:
-        print(f"[Warning] mutagen не прочитал {path}: {e}")
-
-    # --- 2. Fallback: ffprobe для длительности ---
-    if duration is None:
+    def _valid(value) -> float | None:
         try:
-            import subprocess
-            res = subprocess.run(
-                ["ffprobe", "-v", "error",
-                 "-show_entries", "format=duration",
-                 "-of", "default=noprint_wrappers=1:nokey=1",
-                 str(path)],
-                check=False, capture_output=True, text=True,
-                stdin=subprocess.DEVNULL, timeout=30,
-            )
-            if res.returncode == 0:
-                val = res.stdout.strip()
-                if val and val != "N/A":
-                    d = float(val)
-                    if d > 0 and d == d and d != float("inf"):
-                        duration = d
-        except Exception as e:
-            print(f"[Warning] ffprobe не прочитал {path}: {e}")
+            d = float(value)
+        except (TypeError, ValueError):
+            return None
+        if d > 0 and d == d and d != float("inf"):
+            return d
+        return None
 
-    return duration, wxxx_links
+    # 1) message.file.duration
+    file = getattr(message, "file", None)
+    if file is not None:
+        d = _valid(getattr(file, "duration", None))
+        if d is not None:
+            return d
+
+    # 2) message.audio.duration
+    audio = getattr(message, "audio", None)
+    if audio is not None:
+        d = _valid(getattr(audio, "duration", None))
+        if d is not None:
+            return d
+
+    # 3) document.attributes -> DocumentAttributeAudio
+    document = getattr(message, "document", None)
+    if document is None:
+        media = getattr(message, "media", None)
+        document = getattr(media, "document", None) if media is not None else None
+
+    if document is not None:
+        for attr in getattr(document, "attributes", []) or []:
+            if isinstance(attr, DocumentAttributeAudio):
+                d = _valid(getattr(attr, "duration", None))
+                if d is not None:
+                    return d
+
+    return None
+
+
 
 
 def _make_tg_link(forum_username, forum_id, topic_id, message_id) -> str:
@@ -376,6 +362,42 @@ async def get_pinned_message(client: TelegramClient, forum_id: int, topic_id: in
 
     return None
 
+
+async def get_last_pinned_messages(
+    client: TelegramClient,
+    forum_id: int,
+    topic_id: int,
+    limit: int = 5,
+):
+    """
+    Возвращает до `limit` последних закреплённых сообщений в топике.
+
+    Важно: нельзя передавать `reply_to` вместе с `filter`, иначе Telethon
+    игнорирует фильтр (ограничение Telegram API). Поэтому сначала получаем
+    все закрепы канала через InputMessagesFilterPinned, а затем оставляем
+    только те, что относятся к нужному топику.
+    """
+    forum_entity = await client.get_entity(int(forum_id))
+    result = []
+
+    async for message in client.iter_messages(
+        forum_entity,
+        filter=InputMessagesFilterPinned(),   # серверный фильтр только закрепов
+    ):
+        # Проверяем, что сообщение принадлежит нужному топику
+        reply = getattr(message, "reply_to", None)
+        top_id = getattr(reply, "reply_to_top_id", None) if reply else None
+
+        # В форумах у сообщений внутри топика reply_to_top_id == topic_id.
+        # Если top_id is None — это сообщение не в топике (или общий чат).
+        if top_id is not None and int(top_id) == int(topic_id):
+            result.append(msg_from_tgmssage(message, []))
+            if len(result) >= limit:
+                break
+
+    return result
+
+
 async def get_messages_from_last_pin_to_end(client: TelegramClient, forum_id: int, topic_id: int, audio_only: bool, reactions: list):
     """
     Возвращает сообщения в топике `topic_id` форума `forum_id`
@@ -432,67 +454,184 @@ async def get_messages_between_pins(
         forum_entity,
         reply_to=int(topic_id),   # фильтр по топику (ветке)
         min_id=min_id,            # исключает сообщения с ID <= min_id
-        #max_id=max_id,            # исключает сообщения с ID >= max_id
+        max_id=max_id,            # исключает сообщения с ID >= max_id
         reverse=reverse            # порядок: по умолчанию от новых к старым
     ):
         messages.append(msg_from_tgmssage(message,reactions))
 
     return messages
 
-def get_time_threshold (time_filter):
+
+def get_time_threshold(time_filter):
+    """
+    Возвращает тройку (start_date, end_date, limit).
+
+    start_date — нижняя граница включительно (datetime с tzinfo=MSK) или None.
+    end_date   — верхняя граница исключительно (datetime с tzinfo=MSK) или None.
+                 None означает «без верхней границы» (до самого нового сообщения).
+    limit      — False для 'all' (совместимость со старым поведением), иначе None.
+
+    Для 'yesterday' диапазон: [вчера 00:00 MSK, сегодня 00:00 MSK).
+    """
     start_date = None
+    end_date = None
     limit = None
 
+    now_msk = datetime.datetime.now(MSK)
+    today_msk = now_msk.date()
+
     if time_filter == "day":
-        # Сообщения за текущий календарный день (с 00:00)
-        start_date = datetime.datetime.combine(
-            datetime.datetime.now(MSK).date(),
-            time.min,
-            tzinfo=MSK,
-        )    
+        # Сегодня с 00:00 MSK до текущего момента
+        start_date = datetime.datetime.combine(today_msk, time.min, tzinfo=MSK)
+
+    elif time_filter == "yesterday":
+        # Вчера с 00:00 MSK до сегодня 00:00 MSK (верхняя граница не включается)
+        yesterday_msk = today_msk - datetime.timedelta(days=1)
+        start_date = datetime.datetime.combine(yesterday_msk, time.min, tzinfo=MSK)
+        end_date   = datetime.datetime.combine(yesterday_msk, time.max, tzinfo=MSK)
+
     elif time_filter == "week":
-        # Сообщения за последние 7 дней от текущего момента (с 00:00)
-        today_msk = datetime.datetime.now(MSK).date()
+        # Последние 7 дней (с 00:00 MSK)
         start_date = datetime.datetime.combine(
             today_msk - datetime.timedelta(days=7),
-            time.min,
-            tzinfo=MSK,
+            time.min, tzinfo=MSK,
         )
+
     elif time_filter == "month":
-        # Сообщения за последние 30 дней от текущего момента (с 00:00)
-        today_msk = datetime.datetime.now(MSK).date()
+        # С 1-го числа текущего месяца 00:00 MSK
         start_date = datetime.datetime.combine(
             today_msk.replace(day=1),
-            time.min,
-            tzinfo=MSK,
+            time.min, tzinfo=MSK,
         )
+
     elif time_filter == "year":
-        # Сообщения за последние 365 дней от текущего момента
-        today_msk = datetime.datetime.now(MSK).date()
+        # С 1 января текущего года 00:00 MSK
         start_date = datetime.datetime.combine(
-            today_msk.replace(month=1,day=1),
-            time.min,
-            tzinfo=MSK,
+            today_msk.replace(month=1, day=1),
+            time.min, tzinfo=MSK,
         )
+
     elif time_filter == "all":
         limit = False
+
     else:
+        # Неизвестный фильтр — ведём себя как 'all'
         limit = False
 
-    return (start_date,limit)
+    return (start_date, end_date, limit)
 
-async def get_messages_for_period(client: TelegramClient, forum_id: int, topic_id: int, time_filter: str, audio_only: bool, reactions: list):
-    start_date, limit = get_time_threshold (time_filter)
+
+
+async def get_messages_for_period(
+    client: TelegramClient,
+    forum_id: int,
+    topic_id: int,
+    time_filter: str,
+    audio_only: bool,
+    reactions: list,
+):
+    start_date, end_date, limit = get_time_threshold(time_filter)
 
     messages = []
     forum_entity = await client.get_entity(int(forum_id))
 
+    print(f"[Инфо] Период: {time_filter}: {start_date} - {end_date} - {limit}")
+
     async for message in client.iter_messages(forum_entity, reply_to=int(topic_id)):
-        if message.date < start_date:
-            break
-        messages.append(msg_from_tgmssage(message,reactions))
+        start_ok = False
+        end_ok = False
+
+        if start_date is None:
+            start_ok = True
+        else:
+            if message.date >= start_date:
+                start_ok = True
+            else:
+                break
+
+        if end_date is None:
+            end_ok = True
+        else:
+            if message.date <= end_date:
+                end_ok = True
+            else:
+                continue
+
+        if start_ok and end_ok:
+            messages.append(msg_from_tgmssage(message, reactions))
 
     return messages
+    
+
+async def get_messages_from_pinned_to_next_pinned(
+    client: TelegramClient,
+    forum_id: int,
+    topic_id: int,
+    pinned_id: int,
+    audio_only: bool,
+    reactions: list | None = None,
+    include_next_pin: bool = False,
+):
+    """
+    Возвращает сообщения в топике `topic_id` форума `forum_id`,
+    начиная с закреплённого сообщения `pinned_id` (включительно)
+    и до следующего закреплённого сообщения, более позднего по времени.
+
+    Диапазон: [pinned_id, next_pin) — исходный закреп включён, следующее
+    закреплённое сообщение не включается (оно «маркер» конца диапазона
+    и станет началом следующего диапазона).
+
+    Если у закреплённого `pinned_id` нет — или он принадлежит другому топику —
+    возвращается пустой список.
+
+    :param pinned_id:         ID закреплённого сообщения, с которого начинается диапазон.
+    :param reactions:         список эмодзи для подсчёта реакций (передаётся в msg_from_tgmssage).
+    :param include_next_pin:  если True, следующее закреплённое тоже включается в результат.
+    :return:                  список сообщений в формате msg_from_tgmssage.
+    """
+    if reactions is None:
+        reactions = []
+
+    messages = []
+    forum_entity = await client.get_entity(int(forum_id))
+
+    # 1) Включаем исходное закреплённое сообщение
+    pinned_message = await client.get_messages(forum_entity, ids=int(pinned_id))
+    if pinned_message is None:
+        print(f"[Warning] Закреплённое сообщение {pinned_id} не найдено в форуме {forum_id}.")
+        return messages
+
+    if not getattr(pinned_message, "pinned", False):
+        print(f"[Warning] Сообщение {pinned_id} не является закреплённым.")
+        return messages
+
+    # Проверка принадлежности к топику
+    if topic_id:
+        reply = getattr(pinned_message, "reply_to", None)
+        top_id = getattr(reply, "reply_to_top_id", None) if reply else None
+        if top_id is not None and int(top_id) != int(topic_id):
+            print(f"[Warning] Сообщение {pinned_id} не принадлежит топику {topic_id}.")
+            return messages
+
+    messages.append(msg_from_tgmssage(pinned_message, reactions))
+
+    # 2) Идём от pinned_id в сторону более новых сообщений,
+    #    до первого закреплённого (которое и будет «следующим закрепом»).
+    async for message in client.iter_messages(
+        forum_entity,
+        reply_to=int(topic_id),
+        min_id=int(pinned_id),   # строго новее pinned_id
+        reverse=True,            # от старых к новым
+    ):
+        if message.pinned:
+            if include_next_pin:
+                messages.append(msg_from_tgmssage(message, reactions))
+            break
+        messages.append(msg_from_tgmssage(message, reactions))
+
+    return messages
+
+
 
 def fetch_telegram_messages(client, forum_id: str, topic_id: str, pinned_id: str, start_pinned_id:str, time_filter: str, reactions: list, audio_only: bool, limit=50, base_data_dir="data") -> list:
     """
@@ -507,18 +646,27 @@ def fetch_telegram_messages(client, forum_id: str, topic_id: str, pinned_id: str
 
         print(f"Сбор сообщений из топика {topic_id} форума {forum_id}...")
         messages_list = []
-        reactions_list = []
 
         # Вычисляем порог времени на основе переданного фильтра
-        days = 0
-        local_now = datetime.datetime.now()
-        local_today_midnight = datetime.datetime.combine(local_now.date(), datetime.time.min)
-        fetch_limit = limit
+        if time_filter == "pin":
+            # Если pinned_id не задан (0/пусто) — берём последнее закреплённое автоматически.
+            pid = int(pinned_id) if pinned_id else 0
+            if pid <= 0:
+                pinned_msg = await get_pinned_message(client, forum_id, topic_id)
+                if pinned_msg is None:
+                    print(f"[Warning] В топике {topic_id} нет закреплённых сообщений.")
+                    return ([], [])
+                pid = int(pinned_msg["id"])
+                print(f"[Инфо] pinned_id не задан, беру последний закреп: {pid}")
 
-        print(f"Сбор сообщений из топика {topic_id} форума {forum_id} (лимит {fetch_limit})...")
-
-        if time_filter == "pinned":
-            messages = await get_messages_from_last_pin_to_end(client, forum_id, topic_id, audio_only, reactions)
+            messages = await get_messages_from_pinned_to_next_pinned(
+                client=client,
+                forum_id=forum_id,
+                topic_id=topic_id,
+                pinned_id=pid,
+                audio_only=audio_only,
+                reactions=reactions,
+            )
         elif time_filter == "all":
             messages = await get_messages_all(client, forum_id, topic_id, audio_only, reactions)
         else:
@@ -732,6 +880,10 @@ async def download_audios_and_images_by_ids(
     forum_id: int,
     topic_id: int,
     message_ids: list,
+    on_progress=None,
+    should_cancel=None,
+    on_current_file=None,
+    on_bytes=None,   # callable(filename, received_bytes, total_bytes|None)
 ):
     """
     Для каждого ID из `message_ids`:
@@ -739,12 +891,11 @@ async def download_audios_and_images_by_ids(
       1. Скачивает аудио в config.OUTPUT_DIR под именем NN<ext_аудио>.
       2. Ищет соседнее медиа того же автора (картинка → видео/GIF).
       3. Кладёт рядом текстовый файл NN.txt:
-           id, автор, ссылка tg://, имя аудио, длина (MM:SS), картинка, видео,
-           WXXX-ссылки из ID3v2.
+           id сообщения, автор, ссылка tg://, имя аудио, длина (MM:SS).
       4. Все файлы перезаписываются.
 
     :return: [{"message_id", "seq", "audio_path", "image_path",
-               "video_path", "txt_path", "duration_sec", "wxxx"}, ...]
+               "video_path", "txt_path", "duration_sec"}, ...]
     """
     if not os.path.exists(config.OUTPUT_DIR):
         os.makedirs(config.OUTPUT_DIR, exist_ok=True)
@@ -782,6 +933,14 @@ async def download_audios_and_images_by_ids(
     author_cache = {}
 
     for idx, message_id in enumerate(message_ids, start=1):
+        if should_cancel is not None:
+            try:
+                if should_cancel():
+                    print(f"[Отмена] Скачивание прервано на шаге {idx}/{len(message_ids)}.")
+                    break
+            except Exception as e:
+                print(f"[Warning] should_cancel failed: {e}")
+
         seq = f"{idx:02d}"
         report = {
             "message_id": message_id,
@@ -790,8 +949,7 @@ async def download_audios_and_images_by_ids(
             "image_path": None,
             "video_path": None,
             "txt_path": None,
-            "duration_sec": None,
-            "wxxx": [],
+            "duration_sec": None
         }
 
         # ---- 1. Исходное сообщение ----
@@ -836,26 +994,51 @@ async def download_audios_and_images_by_ids(
                 results.append(report)
                 continue
 
+
         msg_local_time = message.date.astimezone()
         print(f"Найдено в {msg_local_time.strftime('%H:%M:%S')}. "
               f"Скачивание аудио: {audio_name}...")
+        if on_current_file is not None:
+            try:
+                on_current_file(idx, len(message_ids), audio_name)
+            except Exception as e:
+                print(f"[Warning] on_current_file failed: {e}")
+
         try:
-            downloaded = await client.download_media(message, file=audio_path)
-            print(f"[Успешно] Аудио сохранено: {downloaded}")
-            report["audio_path"] = downloaded
+            # progress_callback в Telethon синхронный, но вызывается из того же
+            # event-loop. Внутри UI-колбэка мы делаем троттлинг.
+            def _bytes_cb(received, total):
+                if on_bytes is not None:
+                    try:
+                        on_bytes(audio_name, received, total)
+                    except Exception as e:
+                        print(f"[Warning] on_bytes failed: {e}")
+
+            try:
+                downloaded = await client.download_media(
+                    message,
+                    file=audio_path,
+                    progress_callback=_bytes_cb,
+                )
+                print(f"[Успешно] Аудио сохранено: {downloaded}")
+                report["audio_path"] = downloaded
+            except Exception as e:
+                print(f"[Ошибка] Не удалось скачать аудио {audio_name}: {e}")
+                results.append(report)
+                continue
+                
         except Exception as e:
             print(f"[Ошибка] Не удалось скачать аудио {audio_name}: {e}")
             results.append(report)
             continue
 
-        # ---- Длительность + WXXX из скачанного аудио ----
-        audio_duration, wxxx_links = _read_audio_meta(audio_path)
+        # ---- Длительность берём из сообщения Telegram ----
+        audio_duration = _get_message_audio_duration(message)
         report["duration_sec"] = audio_duration
-        report["wxxx"] = wxxx_links
         if audio_duration is not None:
-            print(f"   длительность: {_fmt_duration(audio_duration)}")
-        if wxxx_links:
-            print(f"   WXXX: {len(wxxx_links)} ссылк(и)")
+            print(f"   длительность (из Telegram): {_fmt_duration(audio_duration)}")
+        else:
+            print("   длительность (из Telegram): n/a")
 
         # ---- 2. Соседняя картинка → если нет, то видео/GIF ----
         media_msg = None
@@ -883,9 +1066,6 @@ async def download_audios_and_images_by_ids(
                 vid_msg = None
             if vid_msg is not None:
                 media_msg, media_kind = vid_msg, "video"
-
-        image_filename = None
-        video_filename = None
 
         if media_msg is None:
             print(f"[Инфо] Соседней картинки/видео для сообщения {message_id} не найдено.")
@@ -954,19 +1134,22 @@ async def download_audios_and_images_by_ids(
                 f.write(f"ссылка: {tg_link}\n")
                 f.write(f"аудио: {raw_audio_name or (audio_stem + audio_ext)}\n")
                 f.write(f"длина: {_fmt_duration(audio_duration)}\n")
-                f.write(f"картинка: {image_filename or '-'}\n")
-                f.write(f"видео: {video_filename or '-'}\n")
-                if wxxx_links:
-                    for wxxx in wxxx_links:
-                        f.write(f"WXXX: {wxxx}\n")
-                else:
-                    f.write("WXXX: -\n")
+
             report["txt_path"] = txt_path
             print(f"[Успешно] Текстовый файл сохранён: {txt_path}")
         except Exception as e:
             print(f"[Ошибка] Не удалось записать {txt_path}: {e}")
 
+
         results.append(report)
+
+        # ---- Прогресс ----
+        if on_progress is not None:
+            try:
+                on_progress(idx, len(message_ids))
+            except Exception as e:
+                print(f"[Warning] on_progress failed: {e}")
+
         await asyncio.sleep(1.5)
 
     return results
@@ -1013,10 +1196,11 @@ async def get_image_message_from_same_author(
                 forum_entity,
                 reply_to=int(topic_id),
                 max_id=mid,        # строго старше
-                limit=1,           # только один — непосредственный сосед сверху
+                limit=2,           # только один — непосредственный сосед сверху
             ):
                 if message.sender_id == sender_id and _has_image(message):
                     prev_img = message
+                    break
 
         # Сосед на 1 ниже (ID > mid), самый ближайший
         if prefer in ("any", "next"):
@@ -1025,10 +1209,11 @@ async def get_image_message_from_same_author(
                 reply_to=int(topic_id),
                 min_id=mid,        # строго новее
                 reverse=True,      # от старых к новым → первый = ближайший сверху от mid
-                limit=1,           # только один — непосредственный сосед снизу
+                limit=2,           # только один — непосредственный сосед снизу
             ):
                 if message.sender_id == sender_id and _has_image(message):
                     next_img = message
+                    break
 
         if prefer == "previous":
             return prev_img
