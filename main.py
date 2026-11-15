@@ -152,8 +152,13 @@ def parse_arguments(argv=None) -> argparse.Namespace:
         description="Telegram Player: CLI-режим (скачивание топ-треков) или UI.",
     )
     parser.add_argument(
-        "--proxy", choices=["none", "mtproto"], default="mtproto",
-        help="Режим соединения: none | mtproto (по умолчанию mtproto)",
+        "--proxy",
+        choices=["auto", "direct", "mtproto", "none"],
+        default="auto",
+        help="Режим соединения: "
+             "auto (сначала напрямую, при неудаче — MTProxy) | "
+             "direct / none (только напрямую) | "
+             "mtproto (только MTProxy). По умолчанию: auto.",
     )
     parser.add_argument("--forum", help="Форум: @username, username или числовой ID")
     parser.add_argument("--topic", type=int, help="ID топика (ветки)")
@@ -234,36 +239,26 @@ async def run_headless(args: argparse.Namespace) -> int:
         f"reactions={reactions_list or '<любые>'}"
     )
 
-    import socket, logging
-
-    if args.proxy == "mtproto":
-        print(f"[CLI] TCP-проверка {config.PROXY_IP}:{config.PROXY_PORT} ...")
-        try:
-            with socket.create_connection(
-                (config.PROXY_IP, config.PROXY_PORT), timeout=5
-            ):
-                print("[CLI] TCP до прокси OK.")
-        except Exception as e:
-            print(f"[CLI] TCP до прокси НЕ открывается: {e}")
-            return 1
+    import logging
 
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(name)s %(levelname)s %(message)s",
     )
 
-    client = tg_backend.login(proxy_mode=args.proxy)
-
-    print("[CLI] Подключение к Telegram ...")
+    client = None
+    print(f"[CLI] Подключение к Telegram (режим: {args.proxy}) ...")
     try:
-        await asyncio.wait_for(client.connect(), timeout=20)
-    except asyncio.TimeoutError:
-        print("[CLI] Таймаут 20 с на connect(): прокси/сеть не отвечают.")
-        return 1
+        client, used_mode = await tg_backend.login_and_connect(
+            proxy_mode=args.proxy,
+            direct_timeout=1.0,
+            total_timeout=20.0,
+        )
     except Exception as e:
-        print(f"[CLI] connect() упал: {type(e).__name__}: {e}")
+        print(f"[CLI] Не удалось подключиться: {type(e).__name__}: {e}",
+              file=sys.stderr)
         return 1
-    print("[CLI] Соединение установлено.")
+    print(f"[CLI] Подключено через {used_mode}.")
 
     try:
         # Резолвим forum (username → id, либо оставляем int)
@@ -335,8 +330,7 @@ def main(page: ft.Page, args: argparse.Namespace | None = None):
         args = parse_arguments()
 
     print(f"[Main] Режим соединения (proxy): {args.proxy}")
-    client = tg_backend.login(proxy_mode=args.proxy)
-    backend = TelegramBackend(client=client)
+    backend = TelegramBackend(client=None)   # клиент появится после подключения
     page.telegram_ready = asyncio.Event()
     app_ui = TelegramPlayerUI(page, backend)
     app_ui.build()
@@ -346,8 +340,15 @@ def main(page: ft.Page, args: argparse.Namespace | None = None):
         app_ui.connection_loader.visible = True
         page.update()
         try:
+            client, used_mode = await tg_backend.login_and_connect(
+                proxy_mode=args.proxy,
+                direct_timeout=1.0,
+            )
+            backend.client = client          # теперь backend знает клиента
+            print(f"[Main] Подключено через {used_mode}. Авторизация...")
+
             async with client:
-                print("[Main] Telegram клиент успешно запущен и авторизован!")
+                print(f"[Main] Telegram клиент готов (режим: {used_mode}).")
                 app_ui.connection_loader.visible = False
                 page.update()
                 page.telegram_ready.set()

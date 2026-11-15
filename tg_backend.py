@@ -189,29 +189,102 @@ def _make_tg_link(forum_username, forum_id, topic_id, message_id) -> str:
     return f"tg://privatepost?channel={channel}&post={message_id}"
 
 
-def login(session_name='session_faketls',proxy_mode='mtproto'):
+def login(session_name='session_faketls', proxy_mode='mtproto'):
     """
-    Инициализирует и возвращает настроенный клиент TelegramClient.
-    Для отправки запросов клиент необходимо активировать через 'async with client'.
+    Низкоуровневая фабрика TelegramClient (БЕЗ подключения).
+
+    proxy_mode:
+      'direct' / 'none' — напрямую;
+      'mtproto'         — через FakeTLS MTProxy.
+
+    'auto' здесь НЕ поддерживается — используйте login_and_connect().
     """
-    client = None
+    if proxy_mode == 'auto':
+        raise ValueError(
+            "login(): proxy_mode='auto' не поддерживается. "
+            "Используйте login_and_connect()."
+        )
+
     if proxy_mode == 'mtproto':
-        print("Подключение через FakeTLS MTProxy...")
-        client = TelegramClient(
-            session_name, 
-            config.API_ID, 
+        return TelegramClient(
+            session_name,
+            config.API_ID,
             config.API_HASH,
             connection=connection.ConnectionTcpMTProxyRandomizedIntermediate,
-            proxy=(config.PROXY_IP, config.PROXY_PORT, config.PROXY_SECRET)
+            proxy=(config.PROXY_IP, config.PROXY_PORT, config.PROXY_SECRET),
         )
-    else:
-        print("Подключение напрямую...")
-        client = TelegramClient(
-            session_name, 
-            config.API_ID, 
-            config.API_HASH
+
+    # 'direct' / 'none' и любые другие
+    return TelegramClient(session_name, config.API_ID, config.API_HASH)
+
+
+async def login_and_connect(
+    session_name='session_faketls',
+    proxy_mode='auto',
+    direct_timeout=None,
+    total_timeout=20.0,
+):
+    """
+    Создаёт и ПОДКЛЮЧАЕТ TelegramClient с автоматическим выбором режима.
+
+    proxy_mode:
+      'auto'             — сначала прямое подключение (direct_timeout сек),
+                           при неудаче — через MTProto FakeTLS прокси;
+      'direct' / 'none'  — только напрямую (без fallback);
+      'mtproto'          — только через MTProxy (без fallback).
+
+    :return: (client, used_mode), used_mode ∈ {'direct', 'mtproto'}.
+    """
+    if direct_timeout is None:
+        direct_timeout = float(getattr(config, "DIRECT_TIMEOUT", 1.0))
+
+    # --- ЯВНЫЕ РЕЖИМЫ ---
+    if proxy_mode in ('direct', 'none'):
+        print("[login] Подключение напрямую (без fallback)...")
+        client = login(session_name, proxy_mode='direct')
+        await asyncio.wait_for(client.connect(), timeout=total_timeout)
+        return client, 'direct'
+
+    if proxy_mode == 'mtproto':
+        print("[login] Подключение через FakeTLS MTProxy (без fallback)...")
+        client = login(session_name, proxy_mode='mtproto')
+        await asyncio.wait_for(client.connect(), timeout=total_timeout)
+        return client, 'mtproto'
+
+    if proxy_mode != 'auto':
+        raise ValueError(f"login_and_connect: неизвестный proxy_mode={proxy_mode!r}")
+
+    # --- AUTO: сначала напрямую ---
+    print(f"[login] auto: попытка прямого подключения (timeout={direct_timeout:.2f}s)...")
+    direct_client = login(session_name, proxy_mode='direct')
+    try:
+        await asyncio.wait_for(direct_client.connect(), timeout=direct_timeout)
+        print("[login] auto: прямое подключение успешно.")
+        return direct_client, 'direct'
+    except Exception as e:
+        print(
+            f"[login] auto: прямое подключение не удалось "
+            f"({type(e).__name__}: {e}); переключаюсь на FakeTLS MTProxy."
         )
-    return client
+        # Освобождаем socket и session-файл, чтобы второй клиент мог его открыть
+        try:
+            await direct_client.disconnect()
+        except Exception:
+            pass
+        try:
+            if direct_client.session is not None:
+                direct_client.session.close()
+        except Exception:
+            pass
+        # Даём ОС время окончательно освободить хэндл (актуально для Windows)
+        await asyncio.sleep(0.1)
+
+    # --- AUTO: fallback на MTProxy ---
+    print("[login] auto: подключение через FakeTLS MTProxy...")
+    proxy_client = login(session_name, proxy_mode='mtproto')
+    await asyncio.wait_for(proxy_client.connect(), timeout=total_timeout)
+    print("[login] auto: подключение через FakeTLS MTProxy успешно.")
+    return proxy_client, 'mtproto'
 
 async def get_forums(client, base_data_dir="data"):
     """
@@ -1528,21 +1601,17 @@ async def download_tracks (client, forum_id, topic_id, messages):
 
 # Блок для проверки автономного запуска
 async def main():
-    client = login()
+    client, mode = await login_and_connect(proxy_mode='auto')
+    print(f"Режим подключения: {mode}")
     async with client:
         print("Авторизация успешна!")
         forums = await get_forums(client)
-        
+
         if forums:
-            # ИСПРАВЛЕНО: берём id из первого элемента списка форумов
             f_id = str(forums[0]["id"])
             topics = await get_topics(client, f_id)
-            
             if topics:
-                # ИСПРАВЛЕНО: берём id из первого элемента списка топиков
                 t_id = str(topics[0]["id"])
-                
-                # Вызов новой функции (так как она синхронная, вызываем без await)                
                 fetch_telegram_messages(
                     client=client,
                     forum_id=f_id,
@@ -1551,7 +1620,7 @@ async def main():
                     start_pinned_id="0",
                     time_filter="all",
                     reactions=None,
-                    audio_only=True
+                    audio_only=True,
                 )
 
 
