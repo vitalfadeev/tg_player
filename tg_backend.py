@@ -978,6 +978,25 @@ async def get_next_message_from_same_author(
         return None
 
 
+def _safe_remove(path: str, retries: int = 10, delay: float = 0.2) -> bool:
+    """Удаляет файл с повторами — на Windows хэндл может отпускаться с задержкой."""
+    import time
+
+    for attempt in range(retries):
+        try:
+            os.remove(path)
+            return True
+        except FileNotFoundError:
+            return True
+        except PermissionError:
+            if attempt == retries - 1:
+                return False
+            time.sleep(delay)
+        except Exception as e:
+            print(f"[Ошибка] Не удалось удалить {path}: {e}")
+            return False
+    return False
+
 async def download_audios_and_images_by_ids(
     client: TelegramClient,
     forum_id: int,
@@ -1010,12 +1029,10 @@ async def download_audios_and_images_by_ids(
             for entry in os.listdir(config.OUTPUT_DIR):
                 fp = os.path.join(config.OUTPUT_DIR, entry)
                 if os.path.isfile(fp) or os.path.islink(fp):
-                    try:
-                        os.remove(fp)
+                    if _safe_remove(fp):
                         removed_files += 1
-                    except Exception as e:
+                    else:
                         failed_files += 1
-                        print(f"[Ошибка] Не удалось удалить {fp}: {e}")
             if removed_files or failed_files:
                 print(f"[Инфо] Удалено файлов: {removed_files}"
                       + (f", не удалось: {failed_files}" if failed_files else ""))
@@ -1023,6 +1040,10 @@ async def download_audios_and_images_by_ids(
                 print("[Инфо] Каталог уже был пуст (файлов нет).")
         except Exception as e:
             print(f"[Ошибка] Не удалось очистить каталог {config.OUTPUT_DIR}: {e}")
+
+        # Дать ОС (особенно Windows) время освободить хэндлы после
+        # отменённого предыдущего поколения. Обычно достаточно 100-300 мс.
+        await asyncio.sleep(0.2)
 
     # ---- Username форума один раз (для tg:// ссылок) ----
     forum_username = None
@@ -1090,13 +1111,10 @@ async def download_audios_and_images_by_ids(
         audio_path = os.path.join(config.OUTPUT_DIR, audio_name)
 
         if os.path.exists(audio_path):
-            try:
-                os.remove(audio_path)
-            except Exception as e:
-                print(f"[Ошибка] Не удалось удалить {audio_path}: {e}")
+            if not _safe_remove(audio_path):
+                print(f"[Ошибка] Файл {audio_path} занят — пропускаю сообщение {message_id}.")
                 results.append(report)
                 continue
-
 
         msg_local_time = message.date.astimezone()
         print(f"Найдено в {msg_local_time.strftime('%H:%M:%S')}. "

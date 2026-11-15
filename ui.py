@@ -849,8 +849,9 @@ class TelegramPlayerUI:
         self.page.update()
 
         print(f"[Download] Старт сразу после открытия: N={n}, поколение {my_gen}.")
+        old_task = self.current_download_task
         self.current_download_task = asyncio.run_coroutine_threadsafe(
-            self.run_download_async(my_gen, n), self.main_loop
+            self._restart_download_async(my_gen, n, old_task), self.main_loop
         )
 
 
@@ -867,15 +868,7 @@ class TelegramPlayerUI:
             return
         await self.run_download_async(my_gen, n)
 
-
     async def _cancel_and_wait_task(self, task):
-        """
-        Отменяет concurrent-future и дожидается его фактического завершения.
-
-        Именно ожидание (asyncio.wrap_future) гарантирует, что Telethon
-        успел выполнить finally-блок в download_media и закрыть дескриптор
-        файла, в который шло скачивание.
-        """
         if task is None or task.done():
             return
         print("[Download] Отмена текущей задачи скачивания...")
@@ -886,6 +879,10 @@ class TelegramPlayerUI:
             print("[Download] Задача скачивания отменена, файл освобождён.")
         except Exception as e:
             print(f"[Download] Ошибка при ожидании отмены задачи: {e!r}")
+
+        # Windows: close() в finally не гарантирует немедленное освобождение
+        # хэндла; ОС может держать его ещё десятки-сотни миллисекунд.
+        await asyncio.sleep(0.3)
 
 
     def on_download_radio_changed(self):
@@ -1236,8 +1233,6 @@ class TelegramPlayerUI:
         self._dl_cancelled = True
         self._dl_generation += 1
 
-        # Отменяем активную задачу, чтобы Telethon закрыл файл.
-        # Дожидаемся в фоне (не блокируя UI).
         task = self.current_download_task
         if task is not None and not task.done():
             print("[Download] Отмена активной задачи при закрытии диалога...")
@@ -1253,7 +1248,8 @@ class TelegramPlayerUI:
                 print(f"[Download] pop_dialog failed: {e!r}")
             self._download_dialog = None
 
-        self.current_download_task = None
+        # НЕ обнуляем self.current_download_task — пусть следующий
+        # open_download_dialog / _restart_download_async дождётся его завершения.
         try:
             self.page.update()
         except Exception:
