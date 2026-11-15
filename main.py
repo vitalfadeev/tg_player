@@ -344,16 +344,43 @@ def main(page: ft.Page, args: argparse.Namespace | None = None):
                 proxy_mode=args.proxy,
                 direct_timeout=1.0,
             )
-            backend.client = client          # теперь backend знает клиента
+            backend.client = client
             print(f"[Main] Подключено через {used_mode}. Авторизация...")
 
-            async with client:
+            # ❌ БЫЛО:   async with client:
+            # ✅ СТАЛО:  обычный try/finally — start() НЕ вызывается,
+            #            значит интерактивный input() не всплывает.
+            try:
+                if not await client.is_user_authorized():
+                    from auth_dialog import AuthDialog
+                    print("[Main] Сессия не авторизована — показываю диалог входа.")
+                    auth_ok = await AuthDialog(page, client).authenticate()
+                    if not auth_ok:
+                        print("[Main] Авторизация отменена пользователем.")
+                        app_ui.connection_loader.controls.clear()
+                        app_ui.connection_loader.controls.append(
+                            ft.Text(
+                                "Авторизация отменена. Перезапустите приложение.",
+                                color=ft.Colors.RED_600,
+                                weight=ft.FontWeight.BOLD,
+                            )
+                        )
+                        page.update()
+                        return
+                    print("[Main] Авторизация успешна.")
+
                 print(f"[Main] Telegram клиент готов (режим: {used_mode}).")
                 app_ui.connection_loader.visible = False
                 page.update()
                 page.telegram_ready.set()
                 while True:
                     await asyncio.sleep(3600)
+            finally:
+                try:
+                    await client.disconnect()
+                except Exception as ex:
+                    print(f"[Main] Ошибка при отключении клиента: {ex}")
+
         except Exception as e:
             print(f"[Main] Ошибка при подключении к Telegram: {e}")
             app_ui.connection_loader.controls.clear()

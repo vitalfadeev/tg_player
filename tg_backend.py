@@ -212,10 +212,26 @@ def login(session_name='session_faketls', proxy_mode='mtproto'):
             config.API_HASH,
             connection=connection.ConnectionTcpMTProxyRandomizedIntermediate,
             proxy=(config.PROXY_IP, config.PROXY_PORT, config.PROXY_SECRET),
+            # Добавьте эти параметры:
+            device_model="Desktop",
+            system_version="Windows 10",
+            app_version="4.16.8",
+            lang_code="ru",
+            system_lang_code="ru-RU",            
         )
 
-    # 'direct' / 'none' и любые другие
-    return TelegramClient(session_name, config.API_ID, config.API_HASH)
+    # Для direct/mtproto без прокси:
+    return TelegramClient(
+        session_name,
+        config.API_ID,
+        config.API_HASH,
+        device_model="Desktop",
+        system_version="Windows 10",
+        app_version="4.16.8",
+        lang_code="ru",
+        system_lang_code="ru-RU",
+    )
+        
 
 
 async def login_and_connect(
