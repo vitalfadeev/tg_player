@@ -5,6 +5,7 @@ import traceback
 import asyncio
 import subprocess
 from pathlib import Path
+import concurrent.futures
 
 import config
 
@@ -766,7 +767,7 @@ class TelegramPlayerUI:
         self._dl_bytes_bar        = ft.ProgressBar(value=0)
         self._dl_bytes_text       = ft.Text("", size=11, color=ft.Colors.GREY_700)
         self._dl_progress         = ft.ProgressBar(value=0)
-        self._dl_progress_text    = ft.Text("0/0", size=12)
+        self._dl_progress_text    = ft.Text("0/10", size=12)
 
         # ---- Виджеты сборки видео ----
         self._dl_video_progress     = ft.ProgressBar(value=0)
@@ -831,26 +832,60 @@ class TelegramPlayerUI:
 
         self.page.show_dialog(dialog)
 
-        # Начальные значения — уже после создания всех виджетов
-        self._dl_current_file_text.value = ""
-        self._dl_bytes_bar.value = 0
-        self._dl_bytes_text.value = ""
-        self._dl_progress.value = 0
-        self._dl_progress_text.value = "0/0"
-        self._dl_video_progress.value = 0
-        self._dl_video_segment_text.value = "Сегмент: 0 / 0"
-        self.page.update()
-
         try:
             n = int(self._dl_radio.value)
         except (TypeError, ValueError):
             n = 10
             self._dl_radio.value = "10"
 
+        # Начальные значения — уже после создания всех виджетов
+        self._dl_current_file_text.value = ""
+        self._dl_bytes_bar.value = 0
+        self._dl_bytes_text.value = ""
+        self._dl_progress.value = 0
+        self._dl_progress_text.value = f"0/{n}"
+        self._dl_video_progress.value = 0
+        self._dl_video_segment_text.value = "Сегмент: 0 / 0"
+        self.page.update()
+
         print(f"[Download] Старт сразу после открытия: N={n}, поколение {my_gen}.")
         self.current_download_task = asyncio.run_coroutine_threadsafe(
             self.run_download_async(my_gen, n), self.main_loop
         )
+
+
+    async def _restart_download_async(self, my_gen: int, n: int, old_task):
+        """
+        Отменяет предыдущее скачивание (включая активный вызов
+        Telethon.download_media) и дожидается его завершения,
+        чтобы ОС освободила файловый дескриптор.
+        После этого запускает новое скачивание, если поколение всё ещё актуально.
+        """
+        await self._cancel_and_wait_task(old_task)
+        if self._dl_generation != my_gen:
+            print(f"[Download] Поколение {my_gen} устарело до старта — пропуск.")
+            return
+        await self.run_download_async(my_gen, n)
+
+
+    async def _cancel_and_wait_task(self, task):
+        """
+        Отменяет concurrent-future и дожидается его фактического завершения.
+
+        Именно ожидание (asyncio.wrap_future) гарантирует, что Telethon
+        успел выполнить finally-блок в download_media и закрыть дескриптор
+        файла, в который шло скачивание.
+        """
+        if task is None or task.done():
+            return
+        print("[Download] Отмена текущей задачи скачивания...")
+        task.cancel()
+        try:
+            await asyncio.wrap_future(task)
+        except (asyncio.CancelledError, concurrent.futures.CancelledError):
+            print("[Download] Задача скачивания отменена, файл освобождён.")
+        except Exception as e:
+            print(f"[Download] Ошибка при ожидании отмены задачи: {e!r}")
 
 
     def on_download_radio_changed(self):
@@ -861,12 +896,13 @@ class TelegramPlayerUI:
         except (TypeError, ValueError):
             n = 10
 
-        print(f"[Download] Смена N на {n}, перезапуск (поколение {self._dl_generation + 1}).")
+        print(f"[Download] Смена N на {n}, отмена текущей задачи и перезапуск.")
         self._dl_generation += 1
         my_gen = self._dl_generation
 
+        # Сброс UI до старта нового скачивания
         self._dl_progress.value = 0
-        self._dl_progress_text.value = "0/0"
+        self._dl_progress_text.value = f"0/{n}"
         self._dl_current_file_text.value = ""
         self._dl_bytes_bar.value = 0
         self._dl_bytes_text.value = ""
@@ -874,9 +910,14 @@ class TelegramPlayerUI:
         self._dl_video_segment_text.value = "Сегмент: 0 / 0"
         self.page.update()
 
+        # ВАЖНО: запоминаем старую задачу ДО обновления self.current_download_task,
+        # иначе _restart_download_async отменит сам себя.
+        old_task = self.current_download_task
+
         self.current_download_task = asyncio.run_coroutine_threadsafe(
-            self.run_download_async(my_gen, n), self.main_loop
+            self._restart_download_async(my_gen, n, old_task), self.main_loop
         )
+
 
     async def run_download_async(self, my_gen: int, n: int):
         try:
@@ -913,6 +954,12 @@ class TelegramPlayerUI:
 
             total = len(ids)
             print(f"[Download] Старт: {total} треков (поколение {my_gen}).")
+
+            # Если фактическое количество меньше выбранного в радио-кнопке,
+            # сразу показываем реальный знаменатель (0/total), а не 0/n.
+            if self._dl_generation == my_gen and total != n:
+                self._dl_progress_text.value = f"0/{total}"
+                self.page.update()
 
 
             def on_bytes(filename, received, total):
@@ -1186,10 +1233,18 @@ class TelegramPlayerUI:
 
     def close_download_dialog(self):
         print("[Download] Закрыть: отмена и закрытие диалога.")
-        # Просим цикл остановиться и «обесцениваем» текущее поколение,
-        # чтобы никакие поздние колбэки не писали в уже закрытый UI.
         self._dl_cancelled = True
         self._dl_generation += 1
+
+        # Отменяем активную задачу, чтобы Telethon закрыл файл.
+        # Дожидаемся в фоне (не блокируя UI).
+        task = self.current_download_task
+        if task is not None and not task.done():
+            print("[Download] Отмена активной задачи при закрытии диалога...")
+            task.cancel()
+            asyncio.run_coroutine_threadsafe(
+                self._cancel_and_wait_task(task), self.main_loop
+            )
 
         if self._download_dialog is not None:
             try:
