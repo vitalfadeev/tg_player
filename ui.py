@@ -47,7 +47,7 @@ class TelegramPlayerUI:
             
         print(f"[Python 3.13 Core] UI loop initialized: {self.main_loop}")
         
-        self.EMOJI_ICONS = ['🏆','❤','❤️','🔥','⚡','👍','❤️‍🔥',]
+        self.EMOJI_ICONS = ['🏆','❤','🔥','⚡','👍','❤️‍🔥','👏','🆒','💯','😁','🤣']
 
     def build(self):
         self.page.title = "TG Player"
