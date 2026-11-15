@@ -11,6 +11,7 @@ from telethon.tl.functions.messages import GetForumTopicsRequest
 from telethon.tl.functions.messages import SearchRequest
 from telethon.tl.types import InputMessagesFilterPinned
 from telethon.tl.types import DocumentAttributeAudio
+from telethon.tl.types import InputMessagesFilterEmpty
 MSK = ZoneInfo("Europe/Moscow")
 
 # Импортируем настройки из созданного файла config.py
@@ -539,37 +540,130 @@ async def get_messages_for_period(
     audio_only: bool,
     reactions: list,
 ):
+    """
+    ОПТИМИЗИРОВАННАЯ ВЕРСИЯ.
+
+    Использует messages.SearchRequest с min_date/max_date, чтобы
+    Telegram-сервер отфильтровал сообщения по дате ДО отправки их нам.
+
+    В отличие от iter_messages (GetHistoryRequest):
+      * серверно отсекает сообщения вне диапазона (start_date .. end_date);
+      * меньше round-trip'ов и трафика для узких окон (day/week/month/year);
+      * фильтрация по топику (top_msg_id) — тоже на стороне сервера.
+
+    Для 'all' падаем в get_messages_all — там дат нет.
+    """
     start_date, end_date, limit = get_time_threshold(time_filter)
+
+    # Без дат — SearchRequest не нужен
+    if start_date is None and end_date is None:
+        return await get_messages_all(client, forum_id, topic_id, audio_only, reactions)
 
     messages = []
     forum_entity = await client.get_entity(int(forum_id))
+    topic_id_int = int(topic_id)
 
-    print(f"[Инфо] Период: {time_filter}: {start_date} - {end_date} - {limit}")
+    # SearchRequest требует max_date; если верхней границы нет — берём "сейчас"
+    min_date = start_date
+    max_date = end_date if end_date is not None else datetime.datetime.now(MSK)
 
-    async for message in client.iter_messages(forum_entity, reply_to=int(topic_id)):
-        start_ok = False
-        end_ok = False
+    print(
+        f"[Инфо] Период (оптимизированный): {time_filter}: "
+        f"{min_date.isoformat()} - {max_date.isoformat()}"
+    )
 
-        if start_date is None:
-            start_ok = True
-        else:
-            if message.date >= start_date:
-                start_ok = True
-            else:
-                break
+    batch_size = 100
+    offset_id = 0
+    add_offset = 0
 
-        if end_date is None:
-            end_ok = True
-        else:
-            if message.date <= end_date:
-                end_ok = True
-            else:
+    while True:
+        try:
+            resp = await client(SearchRequest(
+                peer=forum_entity,
+                q='',
+                filter=InputMessagesFilterEmpty(),  # "все сообщения"
+                min_date=min_date,
+                max_date=max_date,
+                offset_id=offset_id,
+                add_offset=add_offset,
+                limit=batch_size,
+                max_id=0,
+                min_id=0,
+                hash=0,
+                top_msg_id=topic_id_int,             # фильтр по топику — серверный
+            ))
+        except Exception as e:
+            print(f"[Ошибка] SearchRequest (period={time_filter}): {e}")
+            break
+
+        if not resp.messages:
+            break
+
+        for message in resp.messages:
+            # Защита: Telegram иногда возвращает "лишние" сообщения на границе
+            reply = getattr(message, "reply_to", None)
+            top_id = getattr(reply, "reply_to_top_id", None) if reply else None
+            if top_id is not None and int(top_id) != topic_id_int:
                 continue
 
-        if start_ok and end_ok:
+            # Клиентская страховка по датам (границы включительно)
+            if start_date is not None and message.date < start_date:
+                continue
+            if end_date is not None and message.date > end_date:
+                continue
+
             messages.append(msg_from_tgmssage(message, reactions))
 
+        # Меньше batch_size — это последняя страница
+        if len(resp.messages) < batch_size:
+            break
+
+        # Следующая страница — назад по времени
+        offset_id = resp.messages[-1].id
+        add_offset = 0
+
+    print(f"[Инфо] Получено сообщений за период: {len(messages)}")
     return messages
+
+# async def get_messages_for_period(
+#     client: TelegramClient,
+#     forum_id: int,
+#     topic_id: int,
+#     time_filter: str,
+#     audio_only: bool,
+#     reactions: list,
+# ):
+#     start_date, end_date, limit = get_time_threshold(time_filter)
+
+#     messages = []
+#     forum_entity = await client.get_entity(int(forum_id))
+
+#     print(f"[Инфо] Период: {time_filter}: {start_date} - {end_date} - {limit}")
+
+#     async for message in client.iter_messages(forum_entity, reply_to=int(topic_id)):
+#         start_ok = False
+#         end_ok = False
+
+#         if start_date is None:
+#             start_ok = True
+#         else:
+#             if message.date >= start_date:
+#                 start_ok = True
+#             else:
+#                 break
+
+#         if end_date is None:
+#             end_ok = True
+#         else:
+#             if message.date <= end_date:
+#                 end_ok = True
+#             else:
+#                 continue
+
+#         if start_ok and end_ok:
+#             messages.append(msg_from_tgmssage(message, reactions))
+
+#     return messages
     
 
 async def get_messages_from_pinned_to_next_pinned(
