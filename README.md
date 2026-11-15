@@ -2,7 +2,7 @@
 ![screen](screen.jpg)
 
 ## Download
-Windows 10/11: [tg_player-1.2.zip](https://github.com/vitalfadeev/tg_player/releases/download/1.2/tg_player-1.2.zip)
+Windows 10/11: [tg_player-1.3.zip](https://github.com/vitalfadeev/tg_player/releases/download/1.3/tg_player-1.3.zip)
 
 ## Command line options
 ```
